@@ -94,6 +94,51 @@ function parseProbeArgs(argv) {
   return result;
 }
 
+const CHECKPOINT_STAGES = ['js-entry', 'electron-loaded', 'paths-configured', 'app-ready',
+  'sqlite-loaded', 'exercise-complete', 'receipt-written'];
+
+function diagnosticPaths(runDir, phase) {
+  if (!path.isAbsolute(runDir) || !['write', 'read'].includes(phase)) throw new Error('Invalid diagnostic scope');
+  const directory = path.join(runDir, 'logs', phase);
+  return { directory, nativeLog: path.join(directory, 'chromium.log'), checkpoint: path.join(directory, 'checkpoint.json') };
+}
+
+// Default-app may retain switches before the script. Accept only our exact prefix,
+// or the ordinary Node/Electron script layout; never discard arbitrary switches.
+function parseProcessArgs(argv, entry = __filename) {
+  const index = argv[1] === entry ? 1 : argv[3] === entry ? 3 : -1;
+  if (index < 0) throw new Error('Invalid probe entrypoint');
+  const args = parseProbeArgs(argv.slice(index + 1));
+  if (index === 3 && (argv[1] !== '--enable-logging=file' ||
+      argv[2] !== `--log-file=${diagnosticPaths(args['--run-dir'], args['--phase']).nativeLog}`)) {
+    throw new Error('Invalid diagnostic switches');
+  }
+  return args;
+}
+
+function checkpointWriter(args, receipt) {
+  let fd;
+  let disabled = false;
+  return {
+    mark(stage) {
+      if (disabled) return;
+      try {
+        if (!CHECKPOINT_STAGES.includes(stage)) throw new Error('Invalid checkpoint stage');
+        fd ??= fs.openSync(diagnosticPaths(args['--run-dir'], args['--phase']).checkpoint, 'wx', 0o600);
+        const text = JSON.stringify({ schemaVersion: 1, stage, phase: receipt.phase, pid: receipt.pid,
+          nonce: receipt.nonce, probeSha256: receipt.probeSha256 });
+        if (Buffer.byteLength(text, 'utf8') > 4096) throw new Error('Oversized diagnostic checkpoint');
+        const bytes = fs.writeSync(fd, text, 0, 'utf8');
+        fs.ftruncateSync(fd, bytes);
+      } catch {
+        // Diagnostic failure must not change capability acceptance or its error.
+        disabled = true;
+      }
+    },
+    close() { if (fd !== undefined) { try { fs.closeSync(fd); } catch { /* Diagnostic only. */ } } },
+  };
+}
+
 function runtimeInfo() {
   return { type: process.type || null, versions: { ...process.versions }, platform: process.platform, arch: process.arch };
 }
@@ -108,21 +153,26 @@ function configureAppPaths(app, runDir) {
   app.disableHardwareAcceleration();
 }
 
-async function main(argv = process.argv.slice(2)) {
-  const args = parseProbeArgs(argv);
+async function main() {
+  const args = parseProcessArgs(process.argv);
   const runtime = runtimeInfo();
   const receipt = {
     schemaVersion: 1, phase: args['--phase'], pid: process.pid,
     nonce: args['--nonce'], dbPath: args['--db'], runtime,
     probeSha256: crypto.createHash('sha256').update(fs.readFileSync(__filename)).digest('hex'),
   };
+  const checkpoint = checkpointWriter(args, receipt);
+  checkpoint.mark('js-entry');
   let app;
   let exitCode = 1;
   try {
     assertRuntime(runtime);
     app = require('electron').app;
+    checkpoint.mark('electron-loaded');
     configureAppPaths(app, args['--run-dir']);
+    checkpoint.mark('paths-configured');
     await app.whenReady();
+    checkpoint.mark('app-ready');
     let DatabaseSync;
     try { ({ DatabaseSync } = require('node:sqlite')); }
     catch (error) {
@@ -132,20 +182,32 @@ async function main(argv = process.argv.slice(2)) {
       throw error;
     }
     if (typeof DatabaseSync !== 'function') throw new Blocked('node:sqlite DatabaseSync unavailable');
+    checkpoint.mark('sqlite-loaded');
     Object.assign(receipt, exerciseDatabase(DatabaseSync, {
       phase: args['--phase'], dbPath: args['--db'], canary: args['--canary'],
     }, receipt), { status: 'PASS' });
+    checkpoint.mark('exercise-complete');
     exitCode = 0;
   } catch (error) {
     receipt.status = error instanceof Blocked ? 'BLOCKED' : 'ERROR';
     receipt.reason = String(error.message).slice(0, 1024);
     exitCode = error instanceof Blocked ? 78 : 1;
   }
-  fs.writeFileSync(args['--receipt'], `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+  try {
+    fs.writeFileSync(args['--receipt'], `${JSON.stringify(receipt, null, 2)}\n`, { flag: 'wx', mode: 0o600 });
+    checkpoint.mark('receipt-written');
+  } finally {
+    checkpoint.close();
+  }
   // The SQLite handle has already closed in finally; no process kill on success.
   if (app) app.exit(exitCode);
   else process.exitCode = exitCode;
 }
 
-module.exports = { Blocked, assertRuntime, assertSQLiteVersion, configure, configureAppPaths, exerciseDatabase, parseProbeArgs };
-if (require.main === module) main().catch(() => { process.exitCode = 1; });
+module.exports = { Blocked, assertRuntime, assertSQLiteVersion, configure, configureAppPaths, exerciseDatabase,
+  parseProbeArgs, parseProcessArgs, diagnosticPaths, CHECKPOINT_STAGES };
+if (require.main === module) main().catch(error => {
+  // Pre-receipt diagnostics only; this is never a capability receipt or PASS.
+  console.error(JSON.stringify({ event: 'probe-unhandled-error', reason: String(error.message).slice(0, 1024) }));
+  process.exitCode = 1;
+});

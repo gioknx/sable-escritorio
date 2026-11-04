@@ -51,8 +51,44 @@ No run Windows `41787197000`, a fase `write` terminou com exit code
 `2147483651`, sem receipt; o relatório permaneceu `ERROR`,
 `nativeElectron: false`. A causa continua **desconhecida**: o JSON arquivado
 não contém stdout/stderr, e esse resultado não prova ausência de SQLite.
+O run posterior `41791507819` também falhou em `write`, sem receipt,
+com o mesmo exit code; stdout contém somente `\r\n` e stderr está vazio,
+sem truncamento. A causa permanece **desconhecida**; não demonstra ausência
+de SQLite. A instrumentação abaixo não foi executada no Windows nesta etapa.
+
+### Diagnóstico adicional de inicialização
+
+Antes de cada spawn, o driver cria `logs/<fase>/` exclusivo e passa somente
+`--enable-logging=file` e `--log-file=<runDir>/logs/<fase>/chromium.log`
+antes do entrypoint. Segundo a [documentação oficial de switches](https://www.electronjs.org/docs/latest/api/command-line-switches),
+logging em arquivo é mais confiável no Windows, requer logging habilitado e
+diretório existente. Isso **não garante** captura antes de um crash inicial.
+O [default_app do Electron 45.0.0](https://raw.githubusercontent.com/electron/electron/v45.0.0/default_app/main.ts)
+pula switches ao localizar o script, mas não confirma reconstrução de argv.
+Por isso o wrapper de argumentos aceita apenas o layout comum ou os dois
+switches exatos antes do entrypoint, com log path correspondente à fase;
+o parser de argumentos do probe não ignora switches desconhecidos.
+
+Após argumentos validados e cálculo do hash, o main registra um checkpoint
+local pequeno em `logs/<fase>/checkpoint.json`. O último marco é um de:
+`js-entry`, `electron-loaded`, `paths-configured`, `app-ready`,
+`sqlite-loaded`, `exercise-complete`, `receipt-written`. O checkpoint contém
+somente schema, marco, fase, PID, nonce e SHA-256 do probe; não inclui ambiente,
+canário, dumps ou segredos. A escrita é best-effort e não muda aceitação.
+`receipt-written` também pode corresponder a receipt BLOCKED/ERROR;
+nenhum marco é receipt, prova nativa, atestado de PASS ou causa do crash.
+
+Na fase que falha, `diagnostics.nativeLog` informa disponibilidade e inclui
+somente cauda UTF-8 de até 4 KiB, lida com seek bounded de arquivo regular,
+sem seguir symlink/junction. `diagnostics.checkpoint` só inclui campos
+whitelisted após conferir PID/nonce/fase/hash e o marco permitido; leitura
+limitada a 4 KiB. Caminhos são derivados do estado de lançamento do driver,
+nunca de campos do receipt/checkpoint. Ausência, corrupção ou caminho inseguro
+produzem `available: false`, preservando o erro original; ausência de checkpoint
+não identifica um estágio. Não há alteração de uploads/workflows JSON-only,
+flags de sandbox/headless, critérios de PASS ou `nativeElectron`.
 Esta alteração só preserva diagnóstico em execuções futuras; não recupera
-os logs perdidos nem constitui nova execução Windows ou evidência nativa.
+logs históricos nem constitui nova execução Windows ou evidência nativa.
 
 ```sh
 node --test experiments/update-auth-sqlite/probe.test.cjs

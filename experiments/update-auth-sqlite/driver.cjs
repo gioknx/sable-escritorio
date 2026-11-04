@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
-const { assertRuntime, assertSQLiteVersion } = require('./electron-main.cjs');
+const { assertRuntime, assertSQLiteVersion, diagnosticPaths, CHECKPOINT_STAGES } = require('./electron-main.cjs');
 const LIMIT = 64 * 1024;
 const TIMEOUT_MS = 20000;
 const digest = content => crypto.createHash('sha256').update(content).digest('hex');
@@ -115,17 +115,80 @@ function runChild(executable, argv, options, logPrefix) {
   });
 }
 
-// Only called with the logPrefix created by runChild, never a receipt-provided path.
-function addFailureDiagnostics(phase) {
-  const tail = stream => {
-    const captured = fs.readFileSync(`${phase.logPrefix}.${stream}.log`);
-    const utf8 = Buffer.from(captured.toString('utf8'), 'utf8');
-    let start = Math.max(0, utf8.length - 4096);
-    // Do not start inside a multibyte UTF-8 character (or inflate replacement bytes).
-    while (start < utf8.length && (utf8[start] & 0xc0) === 0x80) start++;
-    return utf8.subarray(start).toString('utf8');
-  };
-  phase.diagnostics = { stdoutTail: tail('stdout'), stderrTail: tail('stderr') };
+function utf8Tail(captured) {
+  const utf8 = Buffer.from(captured.toString('utf8'), 'utf8');
+  let start = Math.max(0, utf8.length - 4096);
+  while (start < utf8.length && (utf8[start] & 0xc0) === 0x80) start++;
+  return utf8.subarray(start).toString('utf8');
+}
+
+// Read-only, bounded seek; reject links/junctions in all components and non-files.
+// Like validatePaths, this assumes the benchmark tree has no concurrent mutator.
+function readBoundedFile(file, tail = true) {
+  physicalPath(file);
+  const leaf = fs.lstatSync(file);
+  if (!leaf.isFile() || leaf.isSymbolicLink()) throw new Error('Not a regular diagnostic file');
+  const fd = fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW || 0));
+  try {
+    const stat = fs.fstatSync(fd);
+    if (!stat.isFile() || stat.dev !== leaf.dev || stat.ino !== leaf.ino) throw new Error('Diagnostic file changed');
+    if (!tail && stat.size > 4096) throw new Error('Oversized checkpoint');
+    const buffer = Buffer.alloc(Math.min(stat.size, 4096));
+    const bytes = fs.readSync(fd, buffer, 0, buffer.length, tail ? Math.max(0, stat.size - buffer.length) : 0);
+    return { buffer: buffer.subarray(0, bytes), truncated: stat.size > buffer.length };
+  } finally { fs.closeSync(fd); }
+}
+
+function diagnosticTail(file) {
+  try {
+    const { buffer, truncated } = readBoundedFile(file);
+    // Discard a partial leading codepoint only when seeking into the file.
+    let start = 0;
+    if (truncated) while (start < buffer.length && (buffer[start] & 0xc0) === 0x80) start++;
+    return { available: true, tail: utf8Tail(buffer.subarray(start)), truncated };
+  } catch (error) {
+    return { available: false, reason: error.code === 'ENOENT' ? 'missing' : 'unreadable-or-unsafe' };
+  }
+}
+
+function readCheckpoint(file, execution, expected) {
+  try {
+    const value = JSON.parse(readBoundedFile(file, false).buffer.toString('utf8'));
+    if (!value || value.schemaVersion !== 1 || !CHECKPOINT_STAGES.includes(value.stage) ||
+        !Number.isInteger(execution.pid) || execution.pid <= 0 || value.pid !== execution.pid ||
+        value.phase !== expected.phase || value.nonce !== expected.nonce || value.probeSha256 !== expected.probeSha256 ||
+        typeof expected.nonce !== 'string' || typeof expected.probeSha256 !== 'string' ||
+        Object.keys(value).some(key => !['schemaVersion', 'stage', 'phase', 'pid', 'nonce', 'probeSha256'].includes(key))) {
+      throw new Error('Checkpoint correspondence mismatch');
+    }
+    return { available: true, schemaVersion: 1, stage: value.stage, phase: value.phase,
+      pid: value.pid, nonce: value.nonce, probeSha256: value.probeSha256 };
+  } catch (error) {
+    return { available: false, reason: error.code === 'ENOENT' ? 'missing' : 'invalid-or-unsafe' };
+  }
+}
+
+// All paths come from driver launch state, never a receipt/checkpoint-provided path.
+function addFailureDiagnostics(phase, expected) {
+  const stdout = diagnosticTail(`${phase.logPrefix}.stdout.log`);
+  const stderr = diagnosticTail(`${phase.logPrefix}.stderr.log`);
+  phase.diagnostics = { stdoutTail: stdout.available ? stdout.tail : null,
+    stderrTail: stderr.available ? stderr.tail : null };
+  try {
+    const files = diagnosticPaths(expected.runDir, expected.phase);
+    phase.diagnostics.nativeLog = diagnosticTail(files.nativeLog);
+    phase.diagnostics.checkpoint = readCheckpoint(files.checkpoint, phase, expected);
+  } catch {
+    phase.diagnostics.nativeLog = { available: false, reason: 'unavailable-scope' };
+    phase.diagnostics.checkpoint = { available: false, reason: 'unavailable-scope' };
+  }
+}
+
+function buildProbeArgv(probe, expected, receiptPath) {
+  const files = diagnosticPaths(expected.runDir, expected.phase);
+  return ['--enable-logging=file', `--log-file=${files.nativeLog}`, probe,
+    '--phase', expected.phase, '--db', expected.dbPath, '--canary', expected.canary,
+    '--receipt', receiptPath, '--run-dir', expected.runDir, '--nonce', expected.nonce];
 }
 
 function readPhaseReceipt(phase, expected) {
@@ -134,10 +197,10 @@ function readPhaseReceipt(phase, expected) {
     const receipt = JSON.parse(fs.readFileSync(phase.receiptPath, 'utf8'));
     phase.receipt = receipt;
     validateReceipt(receipt, phase, expected);
-    if (receipt.status !== 'PASS') addFailureDiagnostics(phase);
+    if (receipt.status !== 'PASS') addFailureDiagnostics(phase, expected);
     return receipt;
   } catch (error) {
-    addFailureDiagnostics(phase);
+    addFailureDiagnostics(phase, expected);
     throw error;
   }
 }
@@ -177,6 +240,7 @@ async function main(argv = process.argv.slice(2)) {
   if (fs.existsSync(reportPath)) throw new Error('Refusing to overwrite capability.json');
   const report = { schemaVersion: 1, status: 'ERROR', nativeElectron: false,
     scope: 'capability/reopen only; not authentication, durability, crash recovery or NSIS', phases: [] };
+  let diagnosticExpected;
   try {
     const runDir = fs.mkdtempSync(path.join(locations.root, 'sqlite-probe-'));
     report.runDir = runDir;
@@ -187,17 +251,18 @@ async function main(argv = process.argv.slice(2)) {
     const probe = path.join(runDir, 'electron-main.cjs');
     fs.writeFileSync(probe, source, { flag: 'wx', mode: 0o600 });
     const probeSha256 = digest(source);
-    const expected = { dbPath: path.join(runDir, 'canary.sqlite'), canary: crypto.randomBytes(32).toString('hex'),
+    const expected = { runDir, dbPath: path.join(runDir, 'canary.sqlite'), canary: crypto.randomBytes(32).toString('hex'),
       nonce: crypto.randomBytes(32).toString('hex'), probeSha256 };
     report.probeSha256 = probeSha256;
     for (const phase of ['write', 'read']) {
       if (digest(fs.readFileSync(probe)) !== probeSha256) throw new Error('Probe changed before launch');
       const receiptPath = path.join(runDir, `${phase}.receipt.json`);
-      const execution = await runChild(locations.electron, [probe, '--phase', phase, '--db', expected.dbPath,
-        '--canary', expected.canary, '--receipt', receiptPath, '--run-dir', runDir, '--nonce', expected.nonce],
+      diagnosticExpected = { ...expected, phase };
+      fs.mkdirSync(diagnosticPaths(runDir, phase).directory);
+      const execution = await runChild(locations.electron, buildProbeArgv(probe, diagnosticExpected, receiptPath),
       { cwd: runDir, env: childEnvironment(runDir) }, path.join(runDir, 'logs', phase));
       report.phases.push({ phase, receiptPath, ...execution });
-      const receipt = readPhaseReceipt(report.phases.at(-1), { ...expected, phase });
+      const receipt = readPhaseReceipt(report.phases.at(-1), diagnosticExpected);
       if (digest(fs.readFileSync(probe)) !== probeSha256) throw new Error('Probe changed during execution');
       if (receipt.status !== 'PASS') {
         report.status = receipt.status;
@@ -212,7 +277,9 @@ async function main(argv = process.argv.slice(2)) {
     }
   } catch (error) {
     const failedPhase = report.phases.at(-1);
-    if (failedPhase && !failedPhase.diagnostics) addFailureDiagnostics(failedPhase);
+    if (failedPhase && !failedPhase.diagnostics && failedPhase.phase === diagnosticExpected?.phase) {
+      addFailureDiagnostics(failedPhase, diagnosticExpected);
+    }
     report.status = 'ERROR';
     report.reason = String(error.message).slice(0, 1024);
   }
@@ -222,7 +289,7 @@ async function main(argv = process.argv.slice(2)) {
 }
 
 module.exports = { parseArgs, physicalPath, inside, validatePaths, childEnvironment, validateReceipt,
-  runChild, readPhaseReceipt, main };
+  runChild, readPhaseReceipt, buildProbeArgv, diagnosticTail, readCheckpoint, main };
 if (require.main === module) main().then(code => { process.exitCode = code; }).catch(error => {
   console.error(JSON.stringify({ status: 'ERROR', reason: String(error.message).slice(0, 1024) }));
   process.exitCode = 1;
