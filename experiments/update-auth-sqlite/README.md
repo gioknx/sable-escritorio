@@ -64,8 +64,14 @@ antes do entrypoint. Segundo a [documentação oficial de switches](https://www.
 logging em arquivo é mais confiável no Windows, requer logging habilitado e
 diretório existente. Isso **não garante** captura antes de um crash inicial.
 O [default_app do Electron 45.0.0](https://raw.githubusercontent.com/electron/electron/v45.0.0/default_app/main.ts)
-pula switches ao localizar o script, mas não confirma reconstrução de argv.
-Por isso o wrapper de argumentos aceita apenas o layout comum ou os dois
+localiza o script pulando switches e o carrega com
+`await import(url.pathToFileURL(filePath).toString());`, sem modificar
+`process.argv` nesse carregamento. CJS importado dinamicamente não satisfaz
+`require.main === module`: esse defeito do guard foi reproduzido em UNIT antes
+da correção. O entrypoint agora roda no processo `browser` ou como CLI direto;
+imports de helpers no Node continuam sem efeitos, e o CLI Node continua
+BLOCKED/78. Isso não identifica a causa dos crashes Windows históricos.
+O wrapper de argumentos aceita apenas o layout comum ou os dois
 switches exatos antes do entrypoint, com log path correspondente à fase;
 o parser de argumentos do probe não ignora switches desconhecidos.
 
@@ -90,14 +96,69 @@ flags de sandbox/headless, critérios de PASS ou `nativeElectron`.
 Esta alteração só preserva diagnóstico em execuções futuras; não recupera
 logs históricos nem constitui nova execução Windows ou evidência nativa.
 
+### Controle independente, sem SQLite
+
+Antes das fases reais, o driver copia e calcula SHA-256 de `startup-control.cjs`
+em `startup-<aleatório>/`, com perfil, HOME, APPDATA, cache, TEMP e logs próprios,
+separados do probe/banco. Usa o **mesmo `.exe`**, `runChild`, ambiente mínimo,
+prazo e os dois switches de logging; não há outro runtime ou fallback.
+O controle não importa o probe nem `node:sqlite`, não cria banco ou janela.
+Configura userData/sessionData e demais caminhos antes de `whenReady()`, marca
+`electron-loaded` e `app-ready`, e encerra por `app.exit`.
+
+Em Electron browser, a entrada independe de `require.main`. Após verificações
+locais de segurança do destino e limites de tamanho, a primeira marca
+`js-entry` precede parser e guard de runtime. O JSON regular de até 4 KiB em
+`<controlDir>/logs/startup/checkpoint.json` contém fase `startup`, PID/runtime
+reais, hash próprio, nonce, booleano `requireMain` e apenas argv do lançamento
+controlado (até 16 strings, 1024 bytes por string, 2048 bytes no conjunto).
+Não inclui ambiente. Sem Electron 45.0.0 Windows x64 real, o controle emite
+BLOCKED/78; caminho/argumentos inválidos e falha de escrita não viram sucesso.
+Imports Node de helpers são inertes; executar o controle no Node não certifica
+Electron nem SQLite.
+
+`capability.json.control` preserva resultado do processo, marca whitelisted
+vinculada a nonce/PID/hash/fase e argv esperados: lançamento original ou exatamente
+sem os dois switches nativos de logging, como aceita o parser; nenhum outro argumento
+é alterado. Preserva caudas UTF-8 de stdout, stderr e log nativo de até 4 KiB cada. A leitura é limitada, de arquivo regular sem
+links; nenhum caminho vindo do JSON é seguido. Os arquivos são derivados
+somente do estado do driver. Hash da cópia também é conferido antes/depois.
+Marca `READY` significa apenas diagnóstico de startup, **nunca PASS**.
+Se o controle falhar, o relatório mantém erro explícito, causa desconhecida e
+`sqlitePhases: not-started`; as fases SQLite não são executadas e não há
+fallback. Se passar, ambas as fases SQLite originais continuam obrigatórias,
+com runtime/PIDs distintos/nonce/hash/paths, WAL/FULL e SQLite >=3.51.3 intactos.
+Somente elas podem produzir `PASS`/`nativeElectron: true`. Nenhum controle
+prova SQLite, durabilidade, causa histórica ou elimina a necessidade de prova
+Windows real. O artefato continua sendo o JSON existente, sem ampliar upload.
+
 ```sh
 node --test experiments/update-auth-sqlite/probe.test.cjs
 node --check experiments/update-auth-sqlite/electron-main.cjs
 node --check experiments/update-auth-sqlite/driver.cjs
 node --check experiments/update-auth-sqlite/probe.test.cjs
+node --check experiments/update-auth-sqlite/startup-control.cjs
+git diff --check
+git diff --exit-code a5ea2b6 -- experiments/update-auth-windows
 ```
 
-Testes UNIT usam o SQLite builtin do Node e não atestam Electron/Windows.
+Validação local UNIT (Linux, Node v24.20.0), base
+`b39e500a391f4e1b1035d3e94a753ce499769bfa`: o comando real
+`node --test experiments/update-auth-sqlite/probe.test.cjs` terminou com
+**24 pass, 0 fail, 0 skip** (19 anteriores + 5 novos). Os quatro comandos
+`node --check` acima, `git diff --check` e
+`git diff --exit-code a5ea2b6 -- experiments/update-auth-windows` terminaram
+com código zero. A reprodução anterior à edição usou import dinâmico do CJS
+real e conferiu `require.main !== require.cache[file]`; o teste permanente
+confere também fixture CJS via import/CLI e o predicado de entrada.
+Capture os hashes da **mesma árvore testada**; não reutilize um recibo de outra edição:
+
+```sh
+sha256sum experiments/update-auth-sqlite/{driver,electron-main,probe.test,startup-control}.cjs
+```
+
+Nenhuma execução Windows foi feita nesta etapa. Testes UNIT usam o SQLite
+builtin do Node e não atestam Electron/Windows.
 As APIs foram consultadas na documentação oficial [Node v24.22.0 SQLite](https://nodejs.org/docs/v24.22.0/api/sqlite.html)
 e [Electron app](https://www.electronjs.org/docs/latest/api/app).
 Este probe **não prova autenticação, antirollback, durabilidade sob falha,

@@ -10,6 +10,7 @@ const { spawnSync } = require('node:child_process');
 const { DatabaseSync } = require('node:sqlite');
 const probe = require('./electron-main.cjs');
 const driver = require('./driver.cjs');
+const control = require('./startup-control.cjs');
 const canary = 'a'.repeat(64);
 const mainPath = path.join(__dirname, 'electron-main.cjs');
 
@@ -383,6 +384,139 @@ test('UNIT: checkpoint failure cannot change Node BLOCKED; early receipt-write f
   assert.equal(blocked.status, 78);
   assert.equal(JSON.parse(fs.readFileSync(blockedReceipt, 'utf8')).status, 'BLOCKED');
   assert.equal(fs.existsSync(path.join(dir, 'never.sqlite')), false);
+});
+
+test('UNIT: CJS dynamic import bypasses require.main; browser predicate runs without affecting Node imports', async t => {
+  const dir = temporary(t);
+  const fixture = path.join(dir, 'entry.cjs');
+  fs.writeFileSync(fixture, 'module.exports = require.main === module; if (require.main === module) console.log(module.exports);');
+  const { pathToFileURL } = require('node:url');
+  assert.equal((await import(pathToFileURL(fixture).href)).default, false);
+  const cli = spawnSync(process.execPath, [fixture], { encoding: 'utf8', timeout: 5000 });
+  assert.equal(cli.status, 0);
+  assert.equal(cli.stdout.trim(), 'true');
+  assert.equal(probe.isEntrypoint(false, 'browser'), true);
+  assert.equal(probe.isEntrypoint(true, undefined), true);
+  for (const type of [undefined, 'renderer', 'utility']) assert.equal(probe.isEntrypoint(false, type), false);
+  const script = 'Promise.all(process.argv.slice(1).map(p=>import(require("node:url").pathToFileURL(p).href))).then(()=>console.log("inert"));';
+  const child = spawnSync(process.execPath, ['-e', script, mainPath, path.join(__dirname, 'startup-control.cjs')],
+    { cwd: dir, encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
+  assert.equal(child.status, 0, child.stderr);
+  assert.equal(child.stdout.trim(), 'inert');
+  assert.deepEqual(fs.readdirSync(dir), ['entry.cjs']);
+});
+
+function controlFixture(t) {
+  const runDir = temporary(t);
+  const entry = path.join(runDir, 'startup-control.cjs');
+  const source = fs.readFileSync(path.join(__dirname, 'startup-control.cjs'));
+  fs.writeFileSync(entry, source);
+  fs.mkdirSync(control.controlPaths(runDir).directory, { recursive: true });
+  const expected = { runDir, nonce: 'c'.repeat(64), controlSha256: crypto.createHash('sha256').update(source).digest('hex') };
+  const argv = driver.buildControlArgv(entry, expected);
+  expected.argv = [process.execPath, ...argv];
+  return { runDir, entry, expected, argv, file: control.controlPaths(runDir).checkpoint };
+}
+
+test('UNIT: Node control records real PID/runtime before blocking, never certifies Electron or SQLite', t => {
+  const fixture = controlFixture(t);
+  const argv = [fixture.entry, ...fixture.argv.slice(3)];
+  fixture.expected.argv = [process.execPath, ...argv];
+  const blocked = spawnSync(process.execPath, argv, { cwd: fixture.runDir, encoding: 'utf8', timeout: 5000, maxBuffer: 65536 });
+  assert.equal(blocked.status, 78, blocked.stderr);
+  const execution = { pid: blocked.pid, exitCode: blocked.status };
+  const mark = driver.readStartupControl(fixture.file, execution, fixture.expected);
+  assert.equal(mark.available, true);
+  assert.equal(mark.stage, 'js-entry');
+  assert.equal(mark.status, 'BLOCKED');
+  assert.equal(mark.pid, blocked.pid);
+  assert.equal(mark.requireMain, true);
+  assert.equal(mark.runtime.type, null);
+  assert.equal(mark.runtime.versions.electron, null);
+  assert.throws(() => driver.requireReadyControl(mark, execution), /cause unknown/);
+  assert.equal(Object.hasOwn(mark, 'nativeElectron'), false);
+  assert.equal(Object.hasOwn(mark, 'sqliteVersion'), false);
+  assert.equal(fs.readdirSync(fixture.runDir).some(name => /sqlite|receipt/.test(name)), false);
+});
+
+test('UNIT: control marks before parser; marker write failure cannot succeed', t => {
+  const fixture = controlFixture(t);
+  const argv = [fixture.entry, '--bad', 'invalid'];
+  const child = spawnSync(process.execPath, argv, { cwd: fixture.runDir, encoding: 'utf8', timeout: 5000 });
+  assert.equal(child.status, 1);
+  const mark = JSON.parse(fs.readFileSync(fixture.file, 'utf8'));
+  assert.equal(mark.stage, 'js-entry');
+  assert.equal(mark.status, 'ERROR');
+  assert.match(mark.reason, /arguments/);
+  fs.unlinkSync(fixture.file);
+  fs.mkdirSync(fixture.file);
+  const failed = spawnSync(process.execPath, [fixture.entry, ...fixture.argv.slice(3)],
+    { cwd: fixture.runDir, encoding: 'utf8', timeout: 5000 });
+  assert.equal(failed.status, 1);
+  assert.match(failed.stderr, /control-unhandled-error/);
+  assert.equal(driver.readStartupControl(fixture.file, { pid: failed.pid }, fixture.expected).available, false);
+});
+
+test('UNIT: control parser preserves exact two logging switches and isolated scope', t => {
+  const fixture = controlFixture(t);
+  const argv = fixture.expected.argv;
+  assert.deepEqual(control.parseControlArgs(argv, fixture.entry, fixture.runDir), { nonce: fixture.expected.nonce });
+  assert.deepEqual(control.parseControlArgs([process.execPath, fixture.entry, ...fixture.argv.slice(3)], fixture.entry, fixture.runDir),
+    { nonce: fixture.expected.nonce });
+  const other = path.join(fixture.runDir, 'probe');
+  assert.notEqual(control.controlPaths(fixture.runDir).nativeLog, probe.diagnosticPaths(other, 'write').nativeLog);
+  assert.notEqual(driver.childEnvironment(fixture.runDir).APPDATA, driver.childEnvironment(other).APPDATA);
+  for (const invalid of [
+    [argv[0], '--no-sandbox', ...argv.slice(2)],
+    [argv[0], argv[1], '--log-file=/forged', ...argv.slice(3)],
+    [...argv, '--unknown', 'x'], [...argv, '--nonce', fixture.expected.nonce], argv.slice(0, -1),
+    [...argv.slice(0, -1), 'bad-nonce'],
+  ]) assert.throws(() => control.parseControlArgs(invalid, fixture.entry, fixture.runDir));
+  assert.throws(() => control.parseControlArgs(argv, fixture.entry, other));
+  assert.throws(() => control.controlPaths('relative'));
+});
+
+test('UNIT: control JSON whitelist rejects spoofed PID/nonce/hash/path, fake Node READY and unsafe files', t => {
+  const fixture = controlFixture(t);
+  const execution = { pid: 123, exitCode: 0 };
+  const value = { schemaVersion: 1, phase: 'startup', stage: 'app-ready', status: 'READY', pid: 123,
+    nonce: fixture.expected.nonce, controlSha256: fixture.expected.controlSha256, requireMain: false,
+    argv: fixture.expected.argv, runtime: { type: 'browser', versions: { electron: '45.0.0' }, platform: 'win32', arch: 'x64' } };
+  // This JSON is a UNIT fixture, not an Electron execution or a native capability receipt.
+  fs.writeFileSync(fixture.file, JSON.stringify(value));
+  const accepted = driver.readStartupControl(fixture.file, execution, fixture.expected);
+  assert.equal(accepted.available, true);
+  // Electron may consume the two native logging switches; the strict parser already accepts this layout.
+  fs.writeFileSync(fixture.file, JSON.stringify({ ...value, argv: [value.argv[0], ...value.argv.slice(3)] }));
+  assert.equal(driver.readStartupControl(fixture.file, execution, fixture.expected).available, true);
+  fs.writeFileSync(fixture.file, JSON.stringify(value));
+  driver.requireReadyControl(accepted, execution);
+  assert.equal(Object.hasOwn(accepted, 'nativeElectron'), false);
+  assert.equal(accepted.status, 'READY');
+  for (const change of [{ pid: 124 }, { nonce: 'forged' }, { controlSha256: 'forged' }, { phase: 'write' },
+    { path: '/forged' }, { logPrefix: '/forged' }, { nativeElectron: true }, { status: 'PASS' },
+    { argv: [value.argv[0], '--no-sandbox', ...value.argv.slice(2)] }, { argv: [...value.argv, '--extra'] },
+    { requireMain: 'false' }, { argv: ['/forged'] }, { stage: 'js-entry' },
+    { runtime: { ...value.runtime, type: null, versions: { electron: null } } },
+    { runtime: { ...value.runtime, platform: 'linux' } }, { runtime: { ...value.runtime, path: '/forged' } }]) {
+    fs.writeFileSync(fixture.file, JSON.stringify({ ...value, ...change }));
+    const rejected = driver.readStartupControl(fixture.file, execution, fixture.expected);
+    assert.equal(rejected.available, false, JSON.stringify(change));
+    assert.throws(() => driver.requireReadyControl(rejected, execution));
+  }
+  for (const change of [{ exitCode: 1 }, { timedOut: true }, { spawnError: 'failed' }, { signal: 'SIGTERM' }]) {
+    assert.throws(() => driver.requireReadyControl(accepted, { ...execution, ...change }));
+  }
+  for (const text of ['null', '{', ' '.repeat(4097)]) {
+    fs.writeFileSync(fixture.file, text);
+    assert.equal(driver.readStartupControl(fixture.file, execution, fixture.expected).available, false);
+  }
+  fs.unlinkSync(fixture.file);
+  assert.equal(driver.readStartupControl(fixture.file, execution, fixture.expected).available, false);
+  const target = path.join(fixture.runDir, 'target.json');
+  fs.writeFileSync(target, JSON.stringify(value));
+  fs.symlinkSync(target, fixture.file);
+  assert.equal(driver.readStartupControl(fixture.file, execution, fixture.expected).available, false);
 });
 
 test('UNIT: non-Windows driver emits BLOCKED, never native PASS', { skip: process.platform === 'win32' }, () => {
