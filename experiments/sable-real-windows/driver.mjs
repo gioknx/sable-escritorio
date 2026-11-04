@@ -220,12 +220,15 @@ export async function main(argv = process.argv.slice(2), platform = process.plat
     const seedWitness = witnessProblems(witnessOf(seedApp.pid), seedApp.pid, false, portA);
     if (seedWitness.length) throw new Error(`seed bootstrap witness: ${seedWitness.join(', ')}`);
     const cdpA = await Cdp.open(endA.page), coreA = await CorePage.attach(cdpA);
-    const accountId = await coreA.call('auth.login', { homeserver: SYNAPSE.homeserver, identifier: { kind: 'user', user: secrets.username },
+    // auth.login (Core RPC) devolve o user_id Matrix; o account_id local só aparece em session.restore.
+    const loggedInUser = await coreA.call('auth.login', { homeserver: SYNAPSE.homeserver, identifier: { kind: 'user', user: secrets.username },
       password: secrets.password, reauth_account_id: null });
     await coreA.reload();
     const before = await until('seed restore', 120000, () => coreA.call('session.restore', {}).catch(() => null));
-    if (before?.account_id !== accountId || before.user_id !== account.userId || before.needs_reauth !== false || before.homeserver.replace(/\/$/, '') !== SYNAPSE.homeserver)
-      throw new Error('seed restore after reload');
+    const accountId = before?.account_id;
+    if (loggedInUser !== account.userId || typeof accountId !== 'string' || !accountId || before.user_id !== account.userId || before.needs_reauth !== false
+      || typeof before.device_id !== 'string' || !before.device_id || before.homeserver.replace(/\/$/, '') !== SYNAPSE.homeserver)
+      throw new Error(`seed restore after reload: ${JSON.stringify({ loginUserMatches: loggedInUser === account.userId, accountIdPresent: typeof accountId === 'string' && !!accountId, userMatches: before?.user_id === account.userId, needsReauth: before?.needs_reauth, deviceIdPresent: typeof before?.device_id === 'string' && !!before.device_id, homeserverMatches: String(before?.homeserver ?? '').replace(/\/$/, '') === SYNAPSE.homeserver })}`);
     await syncLive(coreA);
     checks.seedCoreLogin = true;
 
