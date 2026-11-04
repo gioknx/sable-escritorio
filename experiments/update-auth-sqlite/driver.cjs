@@ -5,6 +5,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { assertRuntime, assertSQLiteVersion, diagnosticPaths, CHECKPOINT_STAGES } = require('./electron-main.cjs');
+const { controlPaths, assertControlRuntime } = require('./startup-control.cjs');
 const LIMIT = 64 * 1024;
 const TIMEOUT_MS = 20000;
 const digest = content => crypto.createHash('sha256').update(content).digest('hex');
@@ -191,6 +192,56 @@ function buildProbeArgv(probe, expected, receiptPath) {
     '--receipt', receiptPath, '--run-dir', expected.runDir, '--nonce', expected.nonce];
 }
 
+function buildControlArgv(control, expected) {
+  return ['--enable-logging=file', `--log-file=${controlPaths(expected.runDir).nativeLog}`, control,
+    '--phase', 'startup', '--run-dir', expected.runDir, '--nonce', expected.nonce];
+}
+
+function readStartupControl(file, execution, expected) {
+  try {
+    const value = JSON.parse(readBoundedFile(file, false).buffer.toString('utf8'));
+    const argvMatches = JSON.stringify(value?.argv) === JSON.stringify(expected.argv) ||
+      (Array.isArray(expected.argv) && expected.argv[1] === '--enable-logging=file' &&
+        expected.argv[2] === `--log-file=${controlPaths(expected.runDir).nativeLog}` &&
+        JSON.stringify(value?.argv) === JSON.stringify([expected.argv[0], ...expected.argv.slice(3)]));
+    const keys = ['schemaVersion', 'phase', 'stage', 'status', 'pid', 'nonce', 'controlSha256',
+      'runtime', 'requireMain', 'argv', 'reason'];
+    if (!value || value.schemaVersion !== 1 || value.phase !== 'startup' ||
+        !['js-entry', 'electron-loaded', 'app-ready'].includes(value.stage) ||
+        !['STARTING', 'READY', 'BLOCKED', 'ERROR'].includes(value.status) ||
+        !Number.isInteger(execution.pid) || execution.pid <= 0 || value.pid !== execution.pid ||
+        !/^[a-f0-9]{64}$/.test(expected.nonce) || value.nonce !== expected.nonce ||
+        !/^[a-f0-9]{64}$/.test(expected.controlSha256) || value.controlSha256 !== expected.controlSha256 ||
+        typeof value.requireMain !== 'boolean' || Object.keys(value).some(key => !keys.includes(key)) ||
+        (value.reason !== undefined && (typeof value.reason !== 'string' || value.reason.length > 512)) ||
+        !Array.isArray(value.argv) || value.argv.length > 16 ||
+        value.argv.some(arg => typeof arg !== 'string' || Buffer.byteLength(arg) > 1024) ||
+        Buffer.byteLength(JSON.stringify(value.argv)) > 2048 ||
+        !argvMatches) throw new Error('Control correspondence mismatch');
+    const runtime = value.runtime;
+    if (!runtime || Object.keys(runtime).some(key => !['type', 'versions', 'platform', 'arch'].includes(key)) ||
+        !(runtime.type === null || typeof runtime.type === 'string') || !runtime.versions ||
+        Object.keys(runtime.versions).some(key => key !== 'electron') ||
+        !(runtime.versions.electron === null || typeof runtime.versions.electron === 'string') ||
+        typeof runtime.platform !== 'string' || typeof runtime.arch !== 'string') throw new Error('Invalid control runtime');
+    if (value.status === 'READY') {
+      assertControlRuntime(runtime);
+      if (value.stage !== 'app-ready') throw new Error('Incomplete control');
+    }
+    return { available: true, ...value };
+  } catch (error) {
+    return { available: false, reason: error.code === 'ENOENT' ? 'missing' : 'invalid-or-unsafe' };
+  }
+}
+
+function requireReadyControl(mark, execution) {
+  if (!mark.available || mark.status !== 'READY' || mark.stage !== 'app-ready' || execution.exitCode !== 0 ||
+      execution.timedOut || execution.spawnError || execution.signal) {
+    throw new Error('Startup control failed; cause unknown; SQLite phases not run');
+  }
+  assertControlRuntime(mark.runtime);
+}
+
 function readPhaseReceipt(phase, expected) {
   try {
     if (fs.statSync(phase.receiptPath).size > LIMIT) throw new Error('Oversized receipt');
@@ -239,7 +290,8 @@ async function main(argv = process.argv.slice(2)) {
   const reportPath = path.join(locations.out, 'capability.json');
   if (fs.existsSync(reportPath)) throw new Error('Refusing to overwrite capability.json');
   const report = { schemaVersion: 1, status: 'ERROR', nativeElectron: false,
-    scope: 'capability/reopen only; not authentication, durability, crash recovery or NSIS', phases: [] };
+    scope: 'capability/reopen only; not authentication, durability, crash recovery or NSIS', phases: [],
+    sqlitePhases: 'not-started' };
   let diagnosticExpected;
   try {
     const runDir = fs.mkdtempSync(path.join(locations.root, 'sqlite-probe-'));
@@ -247,6 +299,30 @@ async function main(argv = process.argv.slice(2)) {
     for (const directory of ['appdata', 'localappdata', 'home', 'profile', 'logs', 'cache', 'temp']) {
       fs.mkdirSync(path.join(runDir, directory));
     }
+    // A separate copy/profile and the same executable, environment builder, flags and runner.
+    const controlDir = fs.mkdtempSync(path.join(runDir, 'startup-'));
+    for (const directory of ['appdata', 'localappdata', 'home', 'profile', 'logs', 'cache', 'temp']) {
+      fs.mkdirSync(path.join(controlDir, directory));
+    }
+    fs.mkdirSync(controlPaths(controlDir).directory);
+    const controlSource = fs.readFileSync(path.join(__dirname, 'startup-control.cjs'));
+    const control = path.join(controlDir, 'startup-control.cjs');
+    fs.writeFileSync(control, controlSource, { flag: 'wx', mode: 0o600 });
+    const controlExpected = { runDir: controlDir, nonce: crypto.randomBytes(32).toString('hex'),
+      controlSha256: digest(controlSource) };
+    const controlArgv = buildControlArgv(control, controlExpected);
+    controlExpected.argv = [locations.electron, ...controlArgv];
+    if (digest(fs.readFileSync(control)) !== controlExpected.controlSha256) throw new Error('Control changed before launch');
+    const controlExecution = await runChild(locations.electron, controlArgv,
+      { cwd: controlDir, env: childEnvironment(controlDir) }, path.join(controlDir, 'logs', 'startup'));
+    report.control = { phase: 'startup', nonce: controlExpected.nonce, controlSha256: controlExpected.controlSha256,
+      ...controlExecution, mark: readStartupControl(controlPaths(controlDir).checkpoint, controlExecution, controlExpected),
+      diagnostics: { stdout: diagnosticTail(`${controlExecution.logPrefix}.stdout.log`),
+        stderr: diagnosticTail(`${controlExecution.logPrefix}.stderr.log`),
+        nativeLog: diagnosticTail(controlPaths(controlDir).nativeLog) } };
+    if (digest(fs.readFileSync(control)) !== controlExpected.controlSha256) throw new Error('Control changed during execution');
+    requireReadyControl(report.control.mark, controlExecution);
+    report.sqlitePhases = 'started';
     const source = fs.readFileSync(path.join(__dirname, 'electron-main.cjs'));
     const probe = path.join(runDir, 'electron-main.cjs');
     fs.writeFileSync(probe, source, { flag: 'wx', mode: 0o600 });
@@ -289,7 +365,8 @@ async function main(argv = process.argv.slice(2)) {
 }
 
 module.exports = { parseArgs, physicalPath, inside, validatePaths, childEnvironment, validateReceipt,
-  runChild, readPhaseReceipt, buildProbeArgv, diagnosticTail, readCheckpoint, main };
+  runChild, readPhaseReceipt, buildProbeArgv, diagnosticTail, readCheckpoint, main,
+  buildControlArgv, readStartupControl, requireReadyControl };
 if (require.main === module) main().then(code => { process.exitCode = code; }).catch(error => {
   console.error(JSON.stringify({ status: 'ERROR', reason: String(error.message).slice(0, 1024) }));
   process.exitCode = 1;

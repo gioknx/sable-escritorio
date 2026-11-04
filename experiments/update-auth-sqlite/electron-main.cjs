@@ -204,9 +204,15 @@ async function main() {
   else process.exitCode = exitCode;
 }
 
+// Electron 45 default_app imports CJS with import(), so require.main is not this module.
+// Node helper imports remain inert; the main/browser process must run the probe.
+function isEntrypoint(isRequireMain, processType) {
+  return isRequireMain || processType === 'browser';
+}
+
 module.exports = { Blocked, assertRuntime, assertSQLiteVersion, configure, configureAppPaths, exerciseDatabase,
-  parseProbeArgs, parseProcessArgs, diagnosticPaths, CHECKPOINT_STAGES };
-if (require.main === module) main().catch(error => {
+  parseProbeArgs, parseProcessArgs, diagnosticPaths, CHECKPOINT_STAGES, isEntrypoint };
+if (isEntrypoint(require.main === module, process.type)) main().catch(error => {
   // Pre-receipt diagnostics only; this is never a capability receipt or PASS.
   console.error(JSON.stringify({ event: 'probe-unhandled-error', reason: String(error.message).slice(0, 1024) }));
   process.exitCode = 1;
