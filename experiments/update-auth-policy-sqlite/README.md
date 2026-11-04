@@ -1,11 +1,10 @@
-# Policy + SQLite: core isolado e coletor Native preparado
+# Policy + SQLite: core isolado e prova Native verificada
 
 Esta fatia **não integra** `AuthenticatedNsisUpdater`, app, NSIS ou produção.
-O core aprovado permanece inalterado. Driver/coletor Native e workflows estão
-preparados, mas Policy + store **ainda NÃO foram executados no Electron/Windows
-Native nesta entrega e NÃO têm Native PASS**. PASS de UNIT/Node não autoriza
-Native PASS, ativação ou instalação. O canário SQLite de outro experimento não
-certifica esta Policy.
+O core aprovado permanece inalterado. Policy + store passaram no Electron/Windows
+Native no run 41813271165, com recibos conferidos após a execução. Esse PASS é
+somente deste núcleo: não autoriza ativação, instalação ou produção.
+PASS de UNIT/Node e o canário SQLite anterior não substituem essa prova.
 
 ## API nova e dependências existentes
 
@@ -145,18 +144,39 @@ fontes executadas e registra runtime e transcrição nova, não consome recibos
 antigos. Hashes/versões/resultados medidos ficam no recibo da execução, não em
 valores manuais congelados neste README.
 
-## Coletor Native preparado, ainda não executado
+## Evidência Native verificada e procedimento
+
+[Run Windows 41813271165](https://github.com/gioknx/sable-escritorio/actions/runs/41813271165),
+head `9e284fbb6333d65eb752240770e233f8329e1cd3`: job **PASS em 43 s**.
+Windows x64 em **NTFS**, Electron **45.0.0**, SQLite **3.53.4**; dois controles
+independentes, 14 fases, 24 verificações e 16 PIDs distintos. Init/advance,
+reopen, monotonicidade, assinatura/payload, TLS real sem CA e oito fixtures
+negativas passaram. O holder adquiriu exclusão, outro processo recebeu
+SQLITE_BUSY/code5 em **1055,5743 ms**, e após liberar/fechar houve reopen válido.
+
+A conferência posterior baixou somente o artifact público
+`policy-sqlite-native-public-41813271165-1`: recibos e processos correspondentes,
+56 arquivos copiados com hashes reais, fontes rastreadas iguais ao head do Git
+(com normalização CRLF/LF explícita somente na comparação entre plataformas),
+pin ZIP/exe, NTFS e ausência de marcador de PEM privado confirmados.
+Não houve reparo/reset, instalador, app, NSIS, ativação ou acesso a conta.
+
+A primeira revisão identificou uma guarda S omitida nos workflows. A correção
+acrescentou as quatro comparações congeladas antes/depois e rejeitou um mutante
+real em scratch; a execução Windows usou a fonte já corrigida.
+A fonte foi integrada por merge normal no PR #8; o PR #7 foi fechado por reter
+um head desatualizado, sem ignorar a recusa de SHA ou proteção.
 
 `driver.cjs` é um orquestrador Node **assíncrono**, não um proxy que permita
 Node certificar Electron. Sua CLI aceita somente `--electron` e `--out`.
 Fora de Windows x64 retorna `BLOCKED`, exit 78 e `nativeElectron:false`, sem
 criar output ou lançar Electron. Imports Node do main e do driver são inertes.
 
-Uma coleta futura autorizada requer `RUNNER_TEMP` físico, OpenSSL e PowerShell
+Uma coleta autorizada requer `RUNNER_TEMP` físico, OpenSSL e PowerShell
 `pwsh` disponíveis, runtime oficial em `<RUNNER_TEMP>/runtime/electron/electron.exe`
 e seu ZIP em `<RUNNER_TEMP>/runtime/electron.zip`. O output deve ser um diretório
 **ainda ausente**, estritamente dentro de RUNNER_TEMP, fora do checkout e separado
-do runtime. Exemplo (não executado nesta entrega):
+do runtime. Exemplo de comando (adapte os caminhos ao ensaio):
 
 ```sh
 node experiments/update-auth-policy-sqlite/driver.cjs --electron <RUNNER_TEMP>/runtime/electron/electron.exe --out <RUNNER_TEMP>/policy-public-novo
@@ -190,7 +210,7 @@ explicitamente permitida. NODE_OPTIONS, ELECTRON_RUN_AS_NODE, tokens e bypass TL
 não são herdados. A única adição ao env allowlisted é a CA pública própria,
 exceto no teste TLS negativo.
 
-A matriz futura exige exatamente estas fases, sem skips e com PIDs distintos:
+A matriz exige exatamente estas fases, sem skips e com PIDs distintos:
 
 - `init`: HTTPS Ed25519 seq1/v2.2.2, close, leitura do envelope persistido no
   Electron e `Policy.decode` real, reopen, latest seq2/v2.2.3 e idempotência;
@@ -241,8 +261,8 @@ comparações do core aprovado/Gate0 antes e depois; logs públicos separados.
 baixa o ZIP oficial pinado, instala as deps lockadas sem scripts, roda o driver,
 falha em BLOCKED/ERROR/Nativefalse e faz upload-always somente de out público.
 Permissões contents:read; sem credenciais de produção, publicação ou instalação.
-Os workflows **não foram despachados** nesta entrega. O PASS da coleta futura
-continua pendente de execução Windows e revisão de seus recibos reais.
+O workflow Windows foi despachado e seus recibos reais conferidos no run acima.
+A coleta comprovou Policy + store, não instalação nem atualização completa.
 
 ## Ameaças e limites obrigatórios
 
@@ -259,9 +279,8 @@ continua pendente de execução Windows e revisão de seus recibos reais.
   provam durabilidade sob power loss, crash nem semântica universal de disco.
   Não há claim de segurança contra administrador/usuário que controla a árvore
   ou memória do processo, nem contra trocas concorrentes dos arquivos.
-- Esta entrega prepara driver/coletor Native, mas não executa Native Policy+store
-  nem Windows/workflows. Não certifica NTFS, download de instalador, Authenticode,
-  NSIS, instalação, produção ou ativação.
+- O run Native acima mede Policy+store em Windows x64/NTFS. Não certifica
+  download de instalador, Authenticode, NSIS, instalação, produção ou ativação.
   Nada nesta suíte transforma o canário Native de outro experimento em aceite
   desta Policy. A baseline permanece congelada, inclusive seu fsync de diretório
   e eventual EPERM no Windows: nenhum erro foi suprimido ou corrigido nela.
