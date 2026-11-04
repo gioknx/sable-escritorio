@@ -1,0 +1,43 @@
+name: Update authentication - source checks
+
+on:
+  pull_request:
+    paths:
+      - 'experiments/update-auth-windows/**'
+      - '.github/workflows/update-auth-check.yml'
+      - '.github/workflows/update-auth-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: experiments/update-auth-windows
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.22.0'
+          package-manager-cache: false
+      - name: Verify immutable source copies
+        run: |
+          printf '1da99c9b45624455071219caf07c42013cf5373cfb2a177ab35aa304f4f4fe9b  update-auth.cjs\ncac6b2cf851dd9831a6d2660e82c22e12ef3e1a8e7d1fbc01d2bfd032830a148  test.cjs\n' | sha256sum -c -
+      - run: npm ci --ignore-scripts
+      - run: npm run check
+      - run: npm test
+      - name: Non-Windows probe must block, never claim Windows evidence
+        shell: bash
+        run: |
+          set +e
+          node probe-policy.cjs > "$RUNNER_TEMP/update-auth-probe-linux.json"
+          code=$?
+          set -e
+          test "$code" -eq 78
+          node -e 'const fs = require("node:fs"); const p = require("node:path").join(process.env.RUNNER_TEMP, "update-auth-probe-linux.json"); const result = JSON.parse(fs.readFileSync(p, "utf8")); if (result.status !== "BLOQUEADO_NAO_WINDOWS") process.exit(1); console.log(result.status);'

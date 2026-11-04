@@ -1,0 +1,148 @@
+name: Update authentication - Windows gate 0
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Create isolated evidence directory
+        id: evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $dir = Join-Path $env:RUNNER_TEMP ('update-auth-evidence-' + [guid]::NewGuid())
+          New-Item -ItemType Directory -Path $dir | Out-Null
+          "UPDATE_AUTH_EVIDENCE_DIR=$dir" >> $env:GITHUB_ENV
+          [ordered]@{
+            status = 'INITIALIZED'; os = [Environment]::OSVersion.VersionString
+            architecture = [Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+            runnerOS = $env:RUNNER_OS; imageOS = $env:ImageOS; imageVersion = $env:ImageVersion
+            runId = $env:GITHUB_RUN_ID; attempt = $env:GITHUB_RUN_ATTEMPT
+            scope = 'Gate 0 only; not NSIS or autonomous update proof'
+          } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $dir 'environment.json')
+
+      # SHAs resolved from these PUBLIC official repositories through api.github.com.
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: 'false'
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.22.0'
+          package-manager-cache: false
+
+      - name: Verify runtime, immutable copies and official tar
+        id: preflight
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ((node --version) -ne 'v24.22.0') { throw 'Node 24.22.0 required' }
+          if ((node -p process.platform) -ne 'win32' -or (node -p process.arch) -ne 'x64') { throw 'win32/x64 required' }
+          $base = 'experiments/update-auth-windows'
+          $expected = @{
+            'update-auth.cjs' = '1da99c9b45624455071219caf07c42013cf5373cfb2a177ab35aa304f4f4fe9b'
+            'test.cjs' = 'cac6b2cf851dd9831a6d2660e82c22e12ef3e1a8e7d1fbc01d2bfd032830a148'
+          }
+          $hashes = @{}
+          foreach ($file in $expected.Keys) {
+            $actual = (Get-FileHash -Algorithm SHA256 (Join-Path $base $file)).Hash.ToLowerInvariant()
+            if ($actual -ne $expected[$file]) { throw "Immutable source hash mismatch: $file" }
+            $hashes[$file] = $actual
+          }
+          $tar = Join-Path $env:RUNNER_TEMP ('update-auth-updater-' + [guid]::NewGuid() + '.tgz')
+          try {
+            Invoke-WebRequest 'https://registry.npmjs.org/electron-updater/-/electron-updater-6.8.11.tgz' -OutFile $tar
+            $hashes['electron-updater-6.8.11.tgz'] = (Get-FileHash -Algorithm SHA256 $tar).Hash.ToLowerInvariant()
+            if ($hashes['electron-updater-6.8.11.tgz'] -ne 'f1344e79b420da2c390761ffedee2668ca9baf1792786df966ffefce6845e1b2') { throw 'Official tar hash mismatch' }
+          } finally { if (Test-Path -LiteralPath $tar) { Remove-Item -LiteralPath $tar } }
+          $openssl = Get-Command openssl.exe -ErrorAction SilentlyContinue
+          if ($openssl) { $opensslPath = $openssl.Source }
+          else { $opensslPath = Join-Path $env:ProgramFiles 'Git/usr/bin/openssl.exe' }
+          if (-not (Test-Path -LiteralPath $opensslPath)) { throw 'OpenSSL executable unavailable; no TLS fallback' }
+          "UPDATE_AUTH_OPENSSL=$opensslPath" >> $env:GITHUB_ENV
+          $opensslVersion = & $opensslPath version
+          if ($LASTEXITCODE -ne 0) { throw 'OpenSSL unavailable' }
+          [ordered]@{
+            status = 'PASS'; node = (node --version); npm = (npm --version)
+            platform = (node -p process.platform); arch = (node -p process.arch)
+            openssl = $opensslVersion; hashes = $hashes
+          } | ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $env:UPDATE_AUTH_EVIDENCE_DIR 'preflight.json')
+
+      - name: Install exact dependencies without lifecycle scripts
+        id: install
+        working-directory: experiments/update-auth-windows
+        shell: pwsh
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Syntax check
+        id: syntax
+        if: ${{ always() }}
+        working-directory: experiments/update-auth-windows
+        shell: pwsh
+        run: npm run check
+
+      - name: Attempt all immutable UNIT groups
+        id: unit
+        if: ${{ always() }}
+        working-directory: experiments/update-auth-windows
+        shell: pwsh
+        run: node run-unit.cjs
+
+      - name: Attempt native Policy persistence independently
+        id: probe
+        if: ${{ always() }}
+        working-directory: experiments/update-auth-windows
+        shell: pwsh
+        run: node probe-policy.cjs
+
+      - name: Record verdict, never turn a failure or block green
+        id: verdict
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          PREFLIGHT_OUTCOME: ${{ steps.preflight.outcome }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          SYNTAX_OUTCOME: ${{ steps.syntax.outcome }}
+          UNIT_OUTCOME: ${{ steps.unit.outcome }}
+          PROBE_OUTCOME: ${{ steps.probe.outcome }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $outcomes = @{
+            preflight = $env:PREFLIGHT_OUTCOME; install = $env:INSTALL_OUTCOME
+            syntax = $env:SYNTAX_OUTCOME; unit = $env:UNIT_OUTCOME; probe = $env:PROBE_OUTCOME
+          }
+          $passed = @($outcomes.Values | Where-Object { $_ -ne 'success' }).Count -eq 0
+          foreach ($name in @('unit', 'probe')) {
+            $file = Join-Path $env:UPDATE_AUTH_EVIDENCE_DIR "$name.json"
+            if (-not (Test-Path -LiteralPath $file)) {
+              @{ gate = $name; status = 'BLOQUEADO'; reason = 'Gate did not produce evidence'; outcome = $outcomes[$name] } |
+                ConvertTo-Json | Set-Content -Encoding utf8 $file
+              $passed = $false
+            } else {
+              $gate = Get-Content -Raw -LiteralPath $file | ConvertFrom-Json
+              if ($gate.status -ne 'PASS') { $passed = $false }
+            }
+          }
+          @{ status = $(if ($passed) { 'PASS' } else { 'BLOQUEADO_OU_FALHA' }); outcomes = $outcomes
+             scope = 'Only UNIT + native Policy gate 0; not NSIS or autonomous update' } |
+            ConvertTo-Json -Depth 5 | Set-Content -Encoding utf8 (Join-Path $env:UPDATE_AUTH_EVIDENCE_DIR 'verdict.json')
+          if (-not $passed) { throw 'At least one gate failed, blocked, skipped, or lacked evidence' }
+
+      - name: Upload JSON evidence only, including failures
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: update-auth-windows-gate0-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ env.UPDATE_AUTH_EVIDENCE_DIR }}/*.json
+          if-no-files-found: error
+          retention-days: 7
