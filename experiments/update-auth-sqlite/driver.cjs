@@ -115,6 +115,33 @@ function runChild(executable, argv, options, logPrefix) {
   });
 }
 
+// Only called with the logPrefix created by runChild, never a receipt-provided path.
+function addFailureDiagnostics(phase) {
+  const tail = stream => {
+    const captured = fs.readFileSync(`${phase.logPrefix}.${stream}.log`);
+    const utf8 = Buffer.from(captured.toString('utf8'), 'utf8');
+    let start = Math.max(0, utf8.length - 4096);
+    // Do not start inside a multibyte UTF-8 character (or inflate replacement bytes).
+    while (start < utf8.length && (utf8[start] & 0xc0) === 0x80) start++;
+    return utf8.subarray(start).toString('utf8');
+  };
+  phase.diagnostics = { stdoutTail: tail('stdout'), stderrTail: tail('stderr') };
+}
+
+function readPhaseReceipt(phase, expected) {
+  try {
+    if (fs.statSync(phase.receiptPath).size > LIMIT) throw new Error('Oversized receipt');
+    const receipt = JSON.parse(fs.readFileSync(phase.receiptPath, 'utf8'));
+    phase.receipt = receipt;
+    validateReceipt(receipt, phase, expected);
+    if (receipt.status !== 'PASS') addFailureDiagnostics(phase);
+    return receipt;
+  } catch (error) {
+    addFailureDiagnostics(phase);
+    throw error;
+  }
+}
+
 function validateReceipt(receipt, execution, expected) {
   if (execution.timedOut || execution.spawnError || execution.signal || !Number.isInteger(execution.pid) || execution.pid <= 0) {
     throw new Error('Electron process did not finish normally');
@@ -170,10 +197,7 @@ async function main(argv = process.argv.slice(2)) {
         '--canary', expected.canary, '--receipt', receiptPath, '--run-dir', runDir, '--nonce', expected.nonce],
       { cwd: runDir, env: childEnvironment(runDir) }, path.join(runDir, 'logs', phase));
       report.phases.push({ phase, receiptPath, ...execution });
-      if (fs.statSync(receiptPath).size > LIMIT) throw new Error('Oversized receipt');
-      const receipt = JSON.parse(fs.readFileSync(receiptPath, 'utf8'));
-      report.phases.at(-1).receipt = receipt;
-      validateReceipt(receipt, execution, { ...expected, phase });
+      const receipt = readPhaseReceipt(report.phases.at(-1), { ...expected, phase });
       if (digest(fs.readFileSync(probe)) !== probeSha256) throw new Error('Probe changed during execution');
       if (receipt.status !== 'PASS') {
         report.status = receipt.status;
@@ -187,6 +211,8 @@ async function main(argv = process.argv.slice(2)) {
       }
     }
   } catch (error) {
+    const failedPhase = report.phases.at(-1);
+    if (failedPhase && !failedPhase.diagnostics) addFailureDiagnostics(failedPhase);
     report.status = 'ERROR';
     report.reason = String(error.message).slice(0, 1024);
   }
@@ -195,7 +221,8 @@ async function main(argv = process.argv.slice(2)) {
   return report.status === 'PASS' ? 0 : report.status === 'BLOCKED' ? 78 : 1;
 }
 
-module.exports = { parseArgs, physicalPath, inside, validatePaths, childEnvironment, validateReceipt, main };
+module.exports = { parseArgs, physicalPath, inside, validatePaths, childEnvironment, validateReceipt,
+  runChild, readPhaseReceipt, main };
 if (require.main === module) main().then(code => { process.exitCode = code; }).catch(error => {
   console.error(JSON.stringify({ status: 'ERROR', reason: String(error.message).slice(0, 1024) }));
   process.exitCode = 1;
