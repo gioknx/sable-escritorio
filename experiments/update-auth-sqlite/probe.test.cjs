@@ -208,6 +208,34 @@ test('UNIT: receipt PID/hash/phase/nonce and process result must correspond', ()
   assert.throws(() => driver.validateReceipt(success, { ...execution, exitCode: 0 }, expected), probe.Blocked);
 });
 
+test('UNIT: missing receipt preserves bounded UTF-8 tails in failure JSON (Node fixture, not native Electron)', async t => {
+  const dir = temporary(t);
+  const execution = await driver.runChild(process.execPath, ['-e', `
+    process.stdout.write('stdout-prefix-' + 'á😀'.repeat(3000) + '-stdout-end');
+    process.stderr.write(Buffer.concat([Buffer.alloc(5000, 255), Buffer.from('-stderr-end')]));
+    process.exitCode = 1;
+  `], { cwd: dir }, path.join(dir, 'unit'));
+  const phase = { phase: 'write', receiptPath: path.join(dir, 'missing.receipt.json'), ...execution };
+  assert.throws(() => driver.readPhaseReceipt(phase, {}), { code: 'ENOENT' });
+  const report = JSON.parse(JSON.stringify({ fixture: 'UNIT, not native Electron',
+    status: 'ERROR', nativeElectron: false, phases: [phase] }));
+  const saved = report.phases[0];
+  assert.equal(report.status, 'ERROR');
+  assert.equal(report.nativeElectron, false);
+  assert.equal(saved.exitCode, 1);
+  assert.equal(saved.pid, execution.pid);
+  assert.equal(Object.hasOwn(saved, 'receipt'), false);
+  for (const stream of ['stdout', 'stderr']) {
+    const tail = saved.diagnostics[`${stream}Tail`];
+    assert.ok(Buffer.byteLength(tail, 'utf8') <= 4096);
+    assert.ok(tail.endsWith(`-${stream}-end`));
+    assert.ok(!tail.includes(`${stream}-prefix`));
+    assert.equal(Buffer.from(tail, 'utf8').toString('utf8'), tail);
+    assert.ok(fs.statSync(`${execution.logPrefix}.${stream}.log`).size > 4096);
+  }
+  assert.ok(!saved.diagnostics.stdoutTail.includes('\ufffd'));
+});
+
 test('UNIT: non-Windows driver emits BLOCKED, never native PASS', { skip: process.platform === 'win32' }, () => {
   const child = spawnSync(process.execPath, [path.join(__dirname, 'driver.cjs'), '--electron', '/unused/electron.exe',
     '--root', '/unused', '--out', '/unused/out'], { timeout: 5000, encoding: 'utf8', maxBuffer: 65536 });

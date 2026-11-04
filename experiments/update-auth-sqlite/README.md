@@ -38,6 +38,22 @@ CLI/caminhos, o resumo fica em `--out/capability.json`; falhas anteriores à
 validação saem no stderr. Em outro SO o driver só emite JSON `BLOCKED`, sem
 executar o binário nem criar evidência nativa.
 
+Diagnóstico de fase que falha (inclusive sem receipt): o JSON inclui
+`phases[].diagnostics.stdoutTail` e `stderrTail`, cada um limitado a 4 KiB
+em UTF-8, sem cortar caracteres multibyte. São caudas dos buffers já capturados
+nos logs do driver, não nova captura: se `stdoutTruncated`/`stderrTruncated`
+for verdadeiro, o trecho pertence aos primeiros 64 KiB preservados, não ao fim
+da saída total. Nenhum caminho fornecido pelo receipt é usado para ler logs;
+não há dump de ambiente nem novo upload. Os trechos são apenas diagnóstico:
+não autorizam PASS nem substituem receipts, nonce/PID/hash ou as duas fases.
+
+No run Windows `41787197000`, a fase `write` terminou com exit code
+`2147483651`, sem receipt; o relatório permaneceu `ERROR`,
+`nativeElectron: false`. A causa continua **desconhecida**: o JSON arquivado
+não contém stdout/stderr, e esse resultado não prova ausência de SQLite.
+Esta alteração só preserva diagnóstico em execuções futuras; não recupera
+os logs perdidos nem constitui nova execução Windows ou evidência nativa.
+
 ```sh
 node --test experiments/update-auth-sqlite/probe.test.cjs
 node --check experiments/update-auth-sqlite/electron-main.cjs
