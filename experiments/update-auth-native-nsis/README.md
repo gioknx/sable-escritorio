@@ -3,9 +3,32 @@
 Integração isolada, dona deste ensaio; não é Sable, instalador de release,
 ativação nem auto-update pronto para produção. Linux só produz UNIT: o driver
 fora de Windows x64 retorna `78`, `BLOCKED`, `nativeElectron:false`.
+
+## Resultado atual: Native PASS, somente fixture descartável
+
+Run [41828605531](https://github.com/gioknx/sable-escritorio/actions/runs/41828605531),
+fonte `40eca7165c41c6c82ea4cdefc07fa3b6394c9b26`, coletor em **72 segundos**.
+Electron 45.0.0 Windows x64/NTFS, SQLite 3.53.4 e adapter padrão genuíno do
+electron-updater 6.8.11: app A 2.2.1 baixou o NSIS FULL autenticado de
+158.463.617 bytes; o stream adulterado foi rejeitado antes de instalação.
+O processo NSIS real correlacionado por CIM terminou com exit0; os **400
+arquivos** instalados passaram na comparação completa de inventário/hash.
+O driver abriu B 2.2.3 no alvo instalado e confirmou o mesmo arquivo-canário no
+perfil compartilhado. **Não houve reabertura iniciada pelo updater.**
+
+A mãe cruzou recibos/PIDs/argv/exit0, assinatura Ed25519, hashes de inventários
+A/B, origem das nove fontes (incluindo checkout CRLF) e source-before/after,
+mais pins de runtime/compilador e scan de chaves privadas/tokens limpo.
+Artefato público: `native-nsis-public-41828605531-1`; nenhum EXE ou segredo.
+A prova vale para esta fixture: não demonstra o perfil/Core Matrix do Sable,
+receita real de release, encerramento do Core, durabilidade, bootstrap/feed de
+produção, integração no Sable ou ativação de atualização automática.
+
+## Histórico das correções, anterior a esse PASS
+
 Primeiro run Windows `41820223635` compilou NSIS real (400 arquivos), mas a
 primeira fixture saiu com código 1; o coletor apagou o recibo antes de publicar
-a causa. Ainda **não há PASS Native**. A correção preserva erro/stdout/stderr
+a causa. Naquela execução **não houve PASS Native**. A correção preservou erro/stdout/stderr
 limitados antes da limpeza e empacota com nome de EXE próprio, sem alterar bytes
 nem usar `ELECTRON_FORCE_IS_PACKAGED`. Electron 45 rejeita `electron.exe` em
 `App::IsPackaged` (fonte oficial abaixo); adicionar resources/app não basta.
@@ -19,7 +42,7 @@ dependência pode bloquear a instalação até o prazo de 120 s (run: 182 s).
 A correção libera ACK com observador ativo, só depois aguarda/valida o fechamento
 de A; mantém todas as exigências de exit0, arquivos e reabertura. Diagnósticos
 agora também preservam os quatro recibos da instalação, limitados a 8 KiB cada.
-Ainda depende de nova execução Native; nada foi ativado no Sable.
+Essa execução ainda não completou a instalação; nada foi ativado no Sable.
 
 Run `41825220232`: ACK/observador funcionaram; o NSIS real terminou com código
 5 na etapa de extração, sem instalar tudo. Inventário publicado revelou três
@@ -28,7 +51,7 @@ destinos de 260–262 caracteres no alvo que repetia o nonce. O alvo agora é
 compilar, todos os caminhos de arquivo/diretório são validados contra os limites
 Windows. `ClearErrors` restringe o erro à extração; falhas publicam seu recibo e
 lista limitada de arquivos ausentes. O coletor deixa de esperar três minutos se
-o observador já confirmou o encerramento do instalador. Sem novo PASS ainda.
+o observador já confirmou o encerramento do instalador. Essa execução não passou.
 
 ## Fontes congeladas e delta
 
