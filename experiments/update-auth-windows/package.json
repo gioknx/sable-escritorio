@@ -1,0 +1,14 @@
+{
+  "name": "sable-update-auth-windows-gate",
+  "private": true,
+  "version": "0.0.0",
+  "scripts": {
+    "test": "node run-unit.cjs",
+    "probe": "node probe-policy.cjs",
+    "check": "node --check update-auth.cjs && node --check test.cjs && node --check run-unit.cjs && node --check probe-policy.cjs"
+  },
+  "dependencies": {
+    "electron-updater": "6.8.11",
+    "semver": "7.7.3"
+  }
+}
