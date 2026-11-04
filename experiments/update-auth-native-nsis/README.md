@@ -21,6 +21,15 @@ de A; mantém todas as exigências de exit0, arquivos e reabertura. Diagnóstico
 agora também preservam os quatro recibos da instalação, limitados a 8 KiB cada.
 Ainda depende de nova execução Native; nada foi ativado no Sable.
 
+Run `41825220232`: ACK/observador funcionaram; o NSIS real terminou com código
+5 na etapa de extração, sem instalar tudo. Inventário publicado revelou três
+destinos de 260–262 caracteres no alvo que repetia o nonce. O alvo agora é
+`installed` dentro da raiz já exclusiva; nenhum arquivo é retirado. Antes de
+compilar, todos os caminhos de arquivo/diretório são validados contra os limites
+Windows. `ClearErrors` restringe o erro à extração; falhas publicam seu recibo e
+lista limitada de arquivos ausentes. O coletor deixa de esperar três minutos se
+o observador já confirmou o encerramento do instalador. Sem novo PASS ainda.
+
 ## Fontes congeladas e delta
 
 - W: `../update-auth-windows/update-auth.cjs`, base `a5ea2b6`.

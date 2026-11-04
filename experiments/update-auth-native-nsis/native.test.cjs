@@ -46,6 +46,24 @@ test('UNIT handshake diagnostics are bounded and non-authorizing', () => {
     assert.match(snapshot.handshake['installed.json'].diagnosticReadError, /bounded JSON/);
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+test('UNIT full Windows install inventory fits legacy paths without dropping files', () => {
+  const root = 'D:\\a\\_temp\\nsis-private-UNITxx';
+  const files = [{ path: 'resources/app/experiments/update-auth-windows/node_modules/electron-updater/out/differentialDownloader/FileWithEmbeddedBlockMapDifferentialDownloader.js.map' }];
+  const oldTarget = path.win32.join(root, 'installed-' + nonce);
+  assert.ok(path.win32.join(oldTarget, files[0].path).length >= 260, 'measured Windows inventory reproduces old target overflow');
+  const target = D.installationTarget(root, files);
+  assert.equal(target, path.win32.join(root, 'installed'));
+  assert.ok(path.win32.join(target, files[0].path).length < 260);
+  assert.equal(files.length, 1, 'no inventory filtering');
+  assert.throws(() => D.installationTarget('D:\\' + 'a'.repeat(230), files), /NSIS Windows path/);
+});
+test('UNIT extraction errors are scoped and dead installer cannot cause full handshake wait', () => {
+  const nsi = fs.readFileSync(path.join(__dirname, 'fixture.nsi'), 'utf8');
+  assert.match(nsi, /ack_received:\s+ClearErrors[^\n]*\n\s+SetOutPath/);
+  assert.match(nsi, /"status":"EXTRACTION_FAILED"/);
+  const source = fs.readFileSync(require.resolve('./driver.cjs'), 'utf8');
+  assert.ok(source.includes('N.waitJSON(installedPath, 180000, observer.done)'));
+});
 test('UNIT inert imports', () => {
   const r = spawnSync(process.execPath, ['-e', `require(${JSON.stringify(path.join(__dirname, 'driver.cjs'))});require(${JSON.stringify(path.join(__dirname, 'electron-main.cjs'))});require(${JSON.stringify(path.join(__dirname, 'update-auth.cjs'))})`]);
   assert.equal(r.status, 0); assert.equal(r.stdout.length, 0); assert.equal(r.stderr.length, 0);

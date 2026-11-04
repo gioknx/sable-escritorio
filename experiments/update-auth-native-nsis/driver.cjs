@@ -42,7 +42,17 @@ function verifyClone() {
 function packageFor(version) {
   assert.ok(['2.2.1', '2.2.3'].includes(version)); return { ...require('./fixture-package.json'), version };
 }
-function diagnosticSnapshot(privateRoot, executions) {
+function installationTarget(privateRoot, files) {
+  assert.ok(path.win32.isAbsolute(privateRoot));
+  const target = path.win32.join(privateRoot, 'installed'); // privateRoot is already exclusively created for this run.
+  for (const file of files) {
+    assert.ok(!path.win32.isAbsolute(file.path) && !file.path.split(/[\\/]/).includes('..'));
+    const full = path.win32.join(target, file.path);
+    assert.ok(full.length < 260 && path.win32.dirname(full).length < 248, `NSIS Windows path exceeds legacy limits: ${full.length}`);
+  }
+  return target;
+}
+function diagnosticSnapshot(privateRoot, executions, expectedFiles = []) {
   const receipts = {}, handshake = {};
   for (const phase of ['negative', 'positive', 'reopen']) {
     const file = path.join(privateRoot, phase, 'receipt.json');
@@ -58,7 +68,10 @@ function diagnosticSnapshot(privateRoot, executions) {
       catch (error) { handshake[name] = { diagnosticReadError: String(error.message).slice(0, 1024) }; }
     }
   }
+  const target = path.join(privateRoot, 'installed');
+  const missing = expectedFiles.filter(file => !fs.existsSync(path.join(target, file.path))).map(file => file.path);
   return { classification: 'PUBLIC_NON_AUTHORIZING_DIAGNOSTIC', nativeAuthorization: false, receipts, handshake,
+    installation: { target, missingCount: missing.length, firstMissing: missing.slice(0, 16) },
     executions: executions.map(execution => ({ ...execution, stdout: String(execution.stdout ?? '').slice(0, 4096),
       stderr: String(execution.stderr ?? '').slice(0, 4096) })) };
 }
@@ -159,7 +172,7 @@ async function main(argv = process.argv.slice(2)) {
   const compiler = E.physical(path.resolve(options.compiler)); assert.equal(path.basename(compiler).toLowerCase(), 'makensis.exe');
   const report = { status: 'ERROR', nativeElectron: false, classification: 'PUBLIC',
     scope: 'Disposable packaged fixture only; driver-driven reopen, not Sable release or production auto-update' };
-  let privateRoot, server; const live = new Set(), executions = []; let chain = [];
+  let privateRoot, server; const live = new Set(), executions = []; let chain = [], expectedFiles = [];
   const publish = (name, value) => { assert.ok(publicName(name)); N.writeJSON(path.join(out, name), value, 512 * 1024); };
   try {
     verifyClone(); privateRoot = fs.mkdtempSync(path.join(temp, 'nsis-private-')); profiles(path.join(privateRoot, 'tools'));
@@ -190,11 +203,12 @@ async function main(argv = process.argv.slice(2)) {
       '-addext', 'subjectAltName=IP:127.0.0.1', '-keyout', key, '-out', cert], { env: toolEnv, timeout: 30000, maxBuffer: 65536 });
     fs.copyFileSync(cert, path.join(out, 'ca.pem'), fs.constants.COPYFILE_EXCL);
     const nonce = random(), cacheName = 'disposable-nsis-' + nonce;
-    const aRoot = path.join(privateRoot, 'A'), bRoot = path.join(privateRoot, 'B'), target = path.join(privateRoot, 'installed-' + nonce);
+    const aRoot = path.join(privateRoot, 'A'), bRoot = path.join(privateRoot, 'B');
     const a = copyApplication(path.dirname(electron), aRoot, '2.2.1', cacheName), b = copyApplication(path.dirname(electron), bRoot, '2.2.3', cacheName);
     assert.equal(E.hash(a.executable), report.runtime.executableSha256); assert.equal(E.hash(b.executable), report.runtime.executableSha256);
     publish('source-inventory.json', { A: a.items, B: b.items });
     const bFiles = E.inventory(bRoot), installer = path.join(privateRoot, 'fixture.exe');
+    expectedFiles = bFiles; const target = installationTarget(privateRoot, bFiles); report.installTarget = target;
     const handshake = path.join(privateRoot, 'handshake'); fs.mkdirSync(handshake);
     const readyPath = path.join(handshake, 'ready.json'), installedPath = path.join(handshake, 'installed.json'), ack = path.join(handshake, 'ack');
     const defines = { OUTPUT: installer, TARGET: target, PAYLOAD: bRoot, READY: readyPath, INSTALLED: installedPath, ACK: ack, NONCE: nonce };
@@ -266,7 +280,7 @@ async function main(argv = process.argv.slice(2)) {
     assert.deepEqual(await N.waitJSON(observerReady, 30000, observer.done), { pid: ready.pid, nonce, status: 'OBSERVING' });
     for (const item of chain) { assert.equal(typeof item.commandLine, 'string'); item.executableSha256 = E.hash(item.executable); }
     assert.ok(!fs.existsSync(target), 'ready is not installed'); fs.writeFileSync(ack, nonce, { flag: 'wx' });
-    const installed = await N.waitJSON(installedPath, 180000);
+    const installed = await N.waitJSON(installedPath, 180000, observer.done);
     assert.deepEqual(installed, { status: 'INSTALLED', nonce, pid: ready.pid }); E.verifyInventory(target, bFiles);
     const observerExecution = await observer.done; live.delete(observer); cleanExit(observerExecution);
     const installerExit = E.readJSON(installerExitPath); assert.deepEqual(installerExit, { pid: ready.pid, nonce, exitCode: 0 });
@@ -293,14 +307,14 @@ async function main(argv = process.argv.slice(2)) {
     } catch (e) { cleanupError(e); }
     try { if (server) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); } } catch (e) { cleanupError(e); }
     // Preserve actual child failure before deleting private state; diagnostics can never authorize PASS.
-    try { if (privateRoot) publish('diagnostics.json', { ...diagnosticSnapshot(privateRoot, executions), osChain: chain }); } catch (e) { cleanupError(e); }
+    try { if (privateRoot) publish('diagnostics.json', { ...diagnosticSnapshot(privateRoot, executions, expectedFiles), osChain: chain }); } catch (e) { cleanupError(e); }
     try { if (privateRoot) fs.rmSync(privateRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); } catch (e) { cleanupError(e); }
     try { assert.ok(fs.readdirSync(out).every(publicName), 'public artifact allowlist'); } catch (e) { cleanupError(e); }
   }
   publish('result.json', report); console.log(JSON.stringify({ status: report.status, nativeElectron: report.nativeElectron, evidence: path.join(out, 'result.json') }));
   return report.status === 'PASS' && report.nativeElectron ? 0 : 1;
 }
-module.exports = { parseArgs, cloneSource, verifyClone, packageFor, publicName, validateChain, validateCompleted, copyApplication, diagnosticSnapshot, main };
+module.exports = { parseArgs, cloneSource, verifyClone, packageFor, publicName, validateChain, validateCompleted, copyApplication, installationTarget, diagnosticSnapshot, main };
 if (require.main === module) main().then(code => { process.exitCode = code; }).catch(error => {
   console.error(JSON.stringify({ status: 'ERROR', nativeElectron: false, reason: String(error.message).slice(0, 1024) })); process.exitCode = 1;
 });
