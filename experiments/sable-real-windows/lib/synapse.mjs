@@ -71,6 +71,11 @@ export async function registerSyntheticAccount(baseUrl, secrets) {
 export const SQLITE_CHECK_PY = String.raw`
 import json, sqlite3, sys, os
 db, room_id, event_id, user_id, canary = sys.argv[1:6]
+import shutil, tempfile, time
+src = db; tmp = tempfile.mkdtemp(prefix='synapse-ro-'); db = os.path.join(tmp, 'copy.db')
+# WSL1 não suporta os locks do SQLite sobre o arquivo ao vivo; lê-se uma cópia consistente (retenta se pegar escrita no meio).
+for suffix in ('', '-wal', '-shm', '-journal'):
+    if os.path.exists(src + suffix): shutil.copyfile(src + suffix, db + suffix)
 con = sqlite3.connect('file:' + db + '?mode=ro', uri=True)
 row = con.execute('select e.type, j.json from events e join event_json j using(event_id) where e.event_id=? and e.room_id=?', (event_id, room_id)).fetchone()
 out = {'eventFound': row is not None}

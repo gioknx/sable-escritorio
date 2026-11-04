@@ -236,6 +236,8 @@ export async function main(argv = process.argv.slice(2), platform = process.plat
     const canary = `ensaio-canary-${randomBytes(12).toString('hex')}`;
     const roomId = await coreA.call('rooms.create', { name: `ensaio-${nonce}`, topic: null, kind: 'text', public: false, encrypted: true,
       invite: [], parent_space: null, alias: null, room_version: null, join_rule: null, federate: false, predecessor: null });
+    // O Core marca `encrypted` como null até carregar o estado; enviar antes disso produziria texto claro.
+    await until('room encryption state', 60000, async () => (await coreA.call('rooms.list_item', { room_id: roomId }).catch(() => null))?.encrypted === true ? true : null);
     const sub = await coreA.call('timeline.subscribe', { room_id: roomId, focus: { kind: 'live' }, hidden_events: false });
     await coreA.call('messages.send', { room_id: roomId, body: canary });
     const confirmed = await waitTimeline(coreA, sub.subscription, sub.items, items => findConfirmed(items, canary), 'remote canary');
