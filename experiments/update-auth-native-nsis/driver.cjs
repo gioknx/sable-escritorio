@@ -43,7 +43,7 @@ function packageFor(version) {
   assert.ok(['2.2.1', '2.2.3'].includes(version)); return { ...require('./fixture-package.json'), version };
 }
 function diagnosticSnapshot(privateRoot, executions) {
-  const receipts = {};
+  const receipts = {}, handshake = {};
   for (const phase of ['negative', 'positive', 'reopen']) {
     const file = path.join(privateRoot, phase, 'receipt.json');
     if (fs.existsSync(file)) {
@@ -51,7 +51,14 @@ function diagnosticSnapshot(privateRoot, executions) {
       catch (error) { receipts[phase] = { diagnosticReadError: String(error.message).slice(0, 1024) }; }
     }
   }
-  return { classification: 'PUBLIC_NON_AUTHORIZING_DIAGNOSTIC', nativeAuthorization: false, receipts,
+  for (const name of ['ready.json', 'installed.json', 'observer-ready.json', 'installer-exit.json']) {
+    const file = path.join(privateRoot, 'handshake', name);
+    if (fs.existsSync(file)) {
+      try { handshake[name] = E.readJSON(file, 8192); }
+      catch (error) { handshake[name] = { diagnosticReadError: String(error.message).slice(0, 1024) }; }
+    }
+  }
+  return { classification: 'PUBLIC_NON_AUTHORIZING_DIAGNOSTIC', nativeAuthorization: false, receipts, handshake,
     executions: executions.map(execution => ({ ...execution, stdout: String(execution.stdout ?? '').slice(0, 4096),
       stderr: String(execution.stderr ?? '').slice(0, 4096) })) };
 }
@@ -250,20 +257,21 @@ async function main(argv = process.argv.slice(2)) {
     const observed = await execute('pwsh', ['-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference="Stop"; $rows=@(); $id=[int]$env:NSIS_PID; for($i=0;$i -lt 8;$i++){ $p=Get-CimInstance Win32_Process -Filter "ProcessId=$id"; if(-not $p){throw "Missing live installer ancestor"}; $rows+=@{pid=[int]$p.ProcessId;parent=[int]$p.ParentProcessId;executable=$p.ExecutablePath;commandLine=$p.CommandLine}; if($p.ParentProcessId -eq [int]$env:NSIS_PARENT){break}; $id=[int]$p.ParentProcessId }; ConvertTo-Json -InputObject @($rows) -Compress'], {
       env: { ...toolEnv, NSIS_PID: String(ready.pid), NSIS_PARENT: String(positive.job.child.pid) }, timeout: 30000, maxBuffer: 16384 });
     chain = JSON.parse(observed.stdout); validateChain(ready, chain, { nonce, pid: positive.job.child.pid, installer: pos.installer, root: privateRoot });
-    const posExecution = await positive.job.done; live.delete(positive.job); validateApp(pos, positive, posExecution);
     assert.equal(counts.positive.requests, 1); assert.equal(counts.positive.bytes, installerSize);
-    for (const item of chain) { assert.equal(typeof item.commandLine, 'string'); item.executableSha256 = E.hash(item.executable); }
     // Capture a genuine OS process handle before ACK; exit0 is additional proof, not completion alone.
     const observerReady = path.join(handshake, 'observer-ready.json'), installerExitPath = path.join(handshake, 'installer-exit.json');
     const observer = start('pwsh', ['-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference="Stop"; $p=Get-Process -Id ([int]$env:NSIS_PID); $null=$p.Handle; @{pid=$p.Id;nonce=$env:NSIS_NONCE;status="OBSERVING"} | ConvertTo-Json -Compress | Set-Content ($env:NSIS_OBSERVER_READY+".writing"); Move-Item -LiteralPath ($env:NSIS_OBSERVER_READY+".writing") -Destination $env:NSIS_OBSERVER_READY; if(-not $p.WaitForExit(180000)){throw "Installer exit deadline"}; @{pid=$p.Id;nonce=$env:NSIS_NONCE;exitCode=$p.ExitCode} | ConvertTo-Json -Compress | Set-Content ($env:NSIS_EXIT+".writing"); Move-Item -LiteralPath ($env:NSIS_EXIT+".writing") -Destination $env:NSIS_EXIT'], {
       cwd: tools, env: { ...toolEnv, NSIS_PID: String(ready.pid), NSIS_NONCE: nonce, NSIS_OBSERVER_READY: observerReady, NSIS_EXIT: installerExitPath } }); live.add(observer);
     observer.done.then(execution => executions.push({ phase: 'installer-observer', ...execution }));
     assert.deepEqual(await N.waitJSON(observerReady, 30000, observer.done), { pid: ready.pid, nonce, status: 'OBSERVING' });
+    for (const item of chain) { assert.equal(typeof item.commandLine, 'string'); item.executableSha256 = E.hash(item.executable); }
     assert.ok(!fs.existsSync(target), 'ready is not installed'); fs.writeFileSync(ack, nonce, { flag: 'wx' });
     const installed = await N.waitJSON(installedPath, 180000);
     assert.deepEqual(installed, { status: 'INSTALLED', nonce, pid: ready.pid }); E.verifyInventory(target, bFiles);
     const observerExecution = await observer.done; live.delete(observer); cleanExit(observerExecution);
     const installerExit = E.readJSON(installerExitPath); assert.deepEqual(installerExit, { pid: ready.pid, nonce, exitCode: 0 });
+    // Never wait for A stdout/process close while NSIS is blocked on our ACK. Validate its exit after install finishes.
+    const posExecution = await positive.job.done; live.delete(positive.job); validateApp(pos, positive, posExecution);
     publish('positive.json', { receipt: pos, execution: posExecution, ready, chain, installed, installerExit, observerExecution, filesVerified: true, counts: counts.positive });
     const reopened = prepare('reopen', path.join(target, FIXTURE_EXE), b.inventorySha256);
     const bExecution = await reopened.job.done; live.delete(reopened.job); const bReceipt = E.readJSON(reopened.receipt);
@@ -285,7 +293,7 @@ async function main(argv = process.argv.slice(2)) {
     } catch (e) { cleanupError(e); }
     try { if (server) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); } } catch (e) { cleanupError(e); }
     // Preserve actual child failure before deleting private state; diagnostics can never authorize PASS.
-    try { if (privateRoot) publish('diagnostics.json', diagnosticSnapshot(privateRoot, executions)); } catch (e) { cleanupError(e); }
+    try { if (privateRoot) publish('diagnostics.json', { ...diagnosticSnapshot(privateRoot, executions), osChain: chain }); } catch (e) { cleanupError(e); }
     try { if (privateRoot) fs.rmSync(privateRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); } catch (e) { cleanupError(e); }
     try { assert.ok(fs.readdirSync(out).every(publicName), 'public artifact allowlist'); } catch (e) { cleanupError(e); }
   }
