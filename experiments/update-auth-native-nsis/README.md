@@ -3,7 +3,13 @@
 Integração isolada, dona deste ensaio; não é Sable, instalador de release,
 ativação nem auto-update pronto para produção. Linux só produz UNIT: o driver
 fora de Windows x64 retorna `78`, `BLOCKED`, `nativeElectron:false`.
-A execução Native ainda é hipótese até os recibos reais da workflow manual.
+Primeiro run Windows `41820223635` compilou NSIS real (400 arquivos), mas a
+primeira fixture saiu com código 1; o coletor apagou o recibo antes de publicar
+a causa. Ainda **não há PASS Native**. A correção preserva erro/stdout/stderr
+limitados antes da limpeza e empacota com nome de EXE próprio, sem alterar bytes
+nem usar `ELECTRON_FORCE_IS_PACKAGED`. Electron 45 rejeita `electron.exe` em
+`App::IsPackaged` (fonte oficial abaixo); adicionar resources/app não basta.
+https://raw.githubusercontent.com/electron/electron/v45.0.0/shell/browser/api/electron_api_app.cc
 
 ## Fontes congeladas e delta
 
@@ -75,6 +81,9 @@ valida versão Native 2.2.3, PID distinto e canário do mesmo userData A.
 B não importa updater nem chama checkForUpdates. `autoRunAppAfterInstall=false`
 é preservado. Reabertura é **driver-driven**, não updater-iniciada.
 Prazos e observação de JSON/processos substituem esperas fixas de instalação.
+`diagnostics.json` guarda os recibos de erro e saídas limitadas dos processos
+**antes** dessa remoção; sua classificação é não autorizante e não muda nenhum
+critério de Native PASS. Nenhuma falha passa só por ter diagnóstico.
 Cleanup em finally encerra filhos observados e remove toda árvore privada.
 
 ## Evidência pública e limites

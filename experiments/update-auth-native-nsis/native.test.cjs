@@ -9,6 +9,25 @@ const { spawnSync } = require('node:child_process');
 const D = require('./driver.cjs');
 const E = require('./electron-main.cjs');
 const nonce = 'a'.repeat(64);
+test('UNIT failure diagnostics preserve child error before cleanup and never authorize Native', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nsis-failure-diagnostics-'));
+  try {
+    for (const phase of ['negative', 'positive']) fs.mkdirSync(path.join(root, phase));
+    fs.writeFileSync(path.join(root, 'negative', 'receipt.json'), JSON.stringify({ status: 'ERROR', error: { message: 'actual child failure' } }));
+    fs.writeFileSync(path.join(root, 'positive', 'receipt.json'), '{broken');
+    const execution = { phase: 'negative', pid: 123, exitCode: 1, stdout: 'x'.repeat(20000), stderr: 'actual stderr' };
+    const snapshot = D.diagnosticSnapshot(root, [execution]);
+    assert.equal(snapshot.classification, 'PUBLIC_NON_AUTHORIZING_DIAGNOSTIC');
+    assert.equal(snapshot.nativeAuthorization, false);
+    assert.equal(snapshot.receipts.negative.error.message, 'actual child failure');
+    assert.ok(snapshot.receipts.positive.diagnosticReadError);
+    assert.equal(snapshot.receipts.reopen, undefined);
+    assert.equal(snapshot.executions[0].exitCode, 1);
+    assert.equal(snapshot.executions[0].stdout.length, 4096);
+    assert.equal(snapshot.executions[0].stderr, 'actual stderr');
+    assert.equal(execution.stdout.length, 20000, 'diagnostics do not mutate acceptance input');
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 test('UNIT inert imports', () => {
   const r = spawnSync(process.execPath, ['-e', `require(${JSON.stringify(path.join(__dirname, 'driver.cjs'))});require(${JSON.stringify(path.join(__dirname, 'electron-main.cjs'))});require(${JSON.stringify(path.join(__dirname, 'update-auth.cjs'))})`]);
   assert.equal(r.status, 0); assert.equal(r.stdout.length, 0); assert.equal(r.stderr.length, 0);
@@ -83,6 +102,9 @@ test('UNIT actual package source copy preserves byte inventory and excludes npm 
     const runtime = path.join(root, 'UNIT-runtime-not-Electron'); fs.mkdirSync(runtime); fs.mkdirSync(path.join(runtime, 'resources'));
     fs.writeFileSync(path.join(runtime, 'electron.exe'), 'UNIT text, never executed');
     const copied = D.copyApplication(runtime, path.join(root, 'A'), '2.2.1', 'UNIT-cache');
+    assert.notEqual(path.basename(copied.executable).toLowerCase(), 'electron.exe', 'Electron45 Windows identifies electron.exe as unpackaged');
+    assert.equal(E.hash(copied.executable), E.hash(path.join(runtime, 'electron.exe')), 'packaging rename preserves pinned executable bytes');
+    assert.equal(fs.existsSync(path.join(root, 'A/electron.exe')), false);
     const appRoot = path.join(root, 'A/resources/app'); E.verifyInventory(appRoot, copied.items);
     assert.equal(require(path.join(appRoot, 'package.json')).version, '2.2.1');
     assert.equal(fs.existsSync(path.join(appRoot, 'experiments/update-auth-windows/node_modules/.bin')), false);

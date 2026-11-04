@@ -16,6 +16,7 @@ const { controlPaths } = require('../update-auth-sqlite/startup-control.cjs');
 const checkout = path.resolve(__dirname, '../..');
 const random = () => crypto.randomBytes(32).toString('hex');
 const ARCHIVE_SHA256 = 'ae53887a23bb640369c93dbd38c408a2af5c0deb86f2fa76c6c244cb444b7f47';
+const FIXTURE_EXE = 'MindtechNsisFixture.exe'; // Official Electron45 App::IsPackaged rejects basename electron.exe; preserve bytes, never force the flag.
 function parseArgs(argv) {
   const result = {};
   for (let i = 0; i < argv.length; i += 2) {
@@ -40,6 +41,19 @@ function verifyClone() {
 }
 function packageFor(version) {
   assert.ok(['2.2.1', '2.2.3'].includes(version)); return { ...require('./fixture-package.json'), version };
+}
+function diagnosticSnapshot(privateRoot, executions) {
+  const receipts = {};
+  for (const phase of ['negative', 'positive', 'reopen']) {
+    const file = path.join(privateRoot, phase, 'receipt.json');
+    if (fs.existsSync(file)) {
+      try { receipts[phase] = E.readJSON(file); }
+      catch (error) { receipts[phase] = { diagnosticReadError: String(error.message).slice(0, 1024) }; }
+    }
+  }
+  return { classification: 'PUBLIC_NON_AUTHORIZING_DIAGNOSTIC', nativeAuthorization: false, receipts,
+    executions: executions.map(execution => ({ ...execution, stdout: String(execution.stdout ?? '').slice(0, 4096),
+      stderr: String(execution.stderr ?? '').slice(0, 4096) })) };
 }
 const PUBLIC = ['result.json', 'source-inventory.json', 'runtime.json', 'compiler.json', 'source-before.json', 'source-after.json',
   'negative.json', 'positive.json', 'reopen.json', 'control.json', 'ca.pem', 'diagnostics.json'];
@@ -99,6 +113,7 @@ async function pinRuntime(electron, privateRoot) {
 }
 function copyApplication(runtime, destination, version, cacheName) {
   fs.cpSync(runtime, destination, { recursive: true, errorOnExist: true, force: false, dereference: false });
+  fs.renameSync(path.join(destination, 'electron.exe'), path.join(destination, FIXTURE_EXE));
   const resources = path.join(destination, 'resources'), root = path.join(resources, 'app');
   assert.ok(!fs.existsSync(root) && !fs.existsSync(path.join(resources, 'app.asar')), 'pristine runtime only'); fs.mkdirSync(root);
   const names = ['experiments/update-auth-policy-sqlite/policy.cjs', 'experiments/update-auth-policy-sqlite/store.cjs',
@@ -122,7 +137,7 @@ function copyApplication(runtime, destination, version, cacheName) {
   fs.writeFileSync(path.join(resources, 'app-update.yml'), `provider: generic\nurl: https://127.0.0.1/unused\nupdaterCacheDirName: ${cacheName}\n`, { flag: 'wx' });
   const items = E.inventory(root), external = path.join(resources, 'source-inventory.json');
   assert.ok(Buffer.byteLength(JSON.stringify(items)) <= 8 * 1024 * 1024); fs.writeFileSync(external, JSON.stringify(items), { flag: 'wx' });
-  return { executable: path.join(destination, 'electron.exe'), inventorySha256: E.hash(external), items };
+  return { executable: path.join(destination, FIXTURE_EXE), inventorySha256: E.hash(external), items };
 }
 async function main(argv = process.argv.slice(2)) {
   const options = parseArgs(argv);
@@ -137,7 +152,7 @@ async function main(argv = process.argv.slice(2)) {
   const compiler = E.physical(path.resolve(options.compiler)); assert.equal(path.basename(compiler).toLowerCase(), 'makensis.exe');
   const report = { status: 'ERROR', nativeElectron: false, classification: 'PUBLIC',
     scope: 'Disposable packaged fixture only; driver-driven reopen, not Sable release or production auto-update' };
-  let privateRoot, server; const live = new Set(); let chain = [];
+  let privateRoot, server; const live = new Set(), executions = []; let chain = [];
   const publish = (name, value) => { assert.ok(publicName(name)); N.writeJSON(path.join(out, name), value, 512 * 1024); };
   try {
     verifyClone(); privateRoot = fs.mkdtempSync(path.join(temp, 'nsis-private-')); profiles(path.join(privateRoot, 'tools'));
@@ -209,6 +224,7 @@ async function main(argv = process.argv.slice(2)) {
       E.writeJSON(path.join(runDir, 'config.json'), config);
       const argv = ['--phase', phase, '--run-dir', runDir, '--nonce', nonce];
       const job = start(executable, argv, { cwd: runDir, env: P.environment(runDir, cert, process.env, privateRoot) }); live.add(job);
+      job.done.then(execution => executions.push({ phase, ...execution }));
       return { config, job, receipt: path.join(runDir, 'receipt.json') };
     };
     const validateApp = (receipt, prepared, execution) => {
@@ -241,6 +257,7 @@ async function main(argv = process.argv.slice(2)) {
     const observerReady = path.join(handshake, 'observer-ready.json'), installerExitPath = path.join(handshake, 'installer-exit.json');
     const observer = start('pwsh', ['-NoProfile', '-NonInteractive', '-Command', '$ErrorActionPreference="Stop"; $p=Get-Process -Id ([int]$env:NSIS_PID); $null=$p.Handle; @{pid=$p.Id;nonce=$env:NSIS_NONCE;status="OBSERVING"} | ConvertTo-Json -Compress | Set-Content ($env:NSIS_OBSERVER_READY+".writing"); Move-Item -LiteralPath ($env:NSIS_OBSERVER_READY+".writing") -Destination $env:NSIS_OBSERVER_READY; if(-not $p.WaitForExit(180000)){throw "Installer exit deadline"}; @{pid=$p.Id;nonce=$env:NSIS_NONCE;exitCode=$p.ExitCode} | ConvertTo-Json -Compress | Set-Content ($env:NSIS_EXIT+".writing"); Move-Item -LiteralPath ($env:NSIS_EXIT+".writing") -Destination $env:NSIS_EXIT'], {
       cwd: tools, env: { ...toolEnv, NSIS_PID: String(ready.pid), NSIS_NONCE: nonce, NSIS_OBSERVER_READY: observerReady, NSIS_EXIT: installerExitPath } }); live.add(observer);
+    observer.done.then(execution => executions.push({ phase: 'installer-observer', ...execution }));
     assert.deepEqual(await N.waitJSON(observerReady, 30000, observer.done), { pid: ready.pid, nonce, status: 'OBSERVING' });
     assert.ok(!fs.existsSync(target), 'ready is not installed'); fs.writeFileSync(ack, nonce, { flag: 'wx' });
     const installed = await N.waitJSON(installedPath, 180000);
@@ -248,7 +265,7 @@ async function main(argv = process.argv.slice(2)) {
     const observerExecution = await observer.done; live.delete(observer); cleanExit(observerExecution);
     const installerExit = E.readJSON(installerExitPath); assert.deepEqual(installerExit, { pid: ready.pid, nonce, exitCode: 0 });
     publish('positive.json', { receipt: pos, execution: posExecution, ready, chain, installed, installerExit, observerExecution, filesVerified: true, counts: counts.positive });
-    const reopened = prepare('reopen', path.join(target, 'electron.exe'), b.inventorySha256);
+    const reopened = prepare('reopen', path.join(target, FIXTURE_EXE), b.inventorySha256);
     const bExecution = await reopened.job.done; live.delete(reopened.job); const bReceipt = E.readJSON(reopened.receipt);
     validateApp(bReceipt, reopened, bExecution); validateCompleted(bReceipt, installed, ready, positive.job.child.pid);
     assert.equal(bReceipt.paths.userData, userData); publish('reopen.json', { receipt: bReceipt, execution: bExecution, driverDriven: true });
@@ -267,13 +284,15 @@ async function main(argv = process.argv.slice(2)) {
         env: { ...S.childEnvironment(path.join(privateRoot, 'tools')), NSIS_CLEAN_PIDS: chain.map(p => p.pid).join(','), NSIS_CLEAN_ROOT: privateRoot + path.sep }, timeout: 30000, maxBuffer: 4096 });
     } catch (e) { cleanupError(e); }
     try { if (server) { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); } } catch (e) { cleanupError(e); }
+    // Preserve actual child failure before deleting private state; diagnostics can never authorize PASS.
+    try { if (privateRoot) publish('diagnostics.json', diagnosticSnapshot(privateRoot, executions)); } catch (e) { cleanupError(e); }
     try { if (privateRoot) fs.rmSync(privateRoot, { recursive: true, force: true, maxRetries: 20, retryDelay: 100 }); } catch (e) { cleanupError(e); }
     try { assert.ok(fs.readdirSync(out).every(publicName), 'public artifact allowlist'); } catch (e) { cleanupError(e); }
   }
   publish('result.json', report); console.log(JSON.stringify({ status: report.status, nativeElectron: report.nativeElectron, evidence: path.join(out, 'result.json') }));
   return report.status === 'PASS' && report.nativeElectron ? 0 : 1;
 }
-module.exports = { parseArgs, cloneSource, verifyClone, packageFor, publicName, validateChain, validateCompleted, copyApplication, main };
+module.exports = { parseArgs, cloneSource, verifyClone, packageFor, publicName, validateChain, validateCompleted, copyApplication, diagnosticSnapshot, main };
 if (require.main === module) main().then(code => { process.exitCode = code; }).catch(error => {
   console.error(JSON.stringify({ status: 'ERROR', nativeElectron: false, reason: String(error.message).slice(0, 1024) })); process.exitCode = 1;
 });
