@@ -1,0 +1,203 @@
+name: Sable real - manual disposable Windows rehearsal (test only)
+
+# Ensaio de TESTE em runner Windows descartável: Sable genuíno 2.2.2 -> 2.2.3 pelo driver existente.
+# Não publica release, não ativa updates, não toca produção. A entrada privada chega cifrada (SABLE-TI v1,
+# AES-256-GCM) como asset público de prerelease deste repositório; só o passo de decifração vê a chave.
+on:
+  workflow_dispatch:
+    inputs:
+      cipher_url:
+        description: 'Exact https://github.com/gioknx/sable-escritorio/releases/download/<tag>/<asset> of the sealed test input'
+        required: true
+        type: string
+      cipher_sha256:
+        description: 'SHA256 (64 lowercase hex) of the sealed blob, as printed by ci/sealed-input.mjs seal'
+        required: true
+        type: string
+      cipher_size:
+        description: 'Exact size in bytes of the sealed blob, as printed by ci/sealed-input.mjs seal'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sable-real:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Reserve short NTFS private root; public output must remain absent for the driver
+        id: reserve
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP "sr-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $out = Join-Path $env:RUNNER_TEMP "sp-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $root) { throw 'Refusing existing private root' }
+          if (Test-Path -LiteralPath $out) { throw 'Refusing existing public output' }
+          if ($env:NODE_OPTIONS -or $env:NODE_TLS_REJECT_UNAUTHORIZED -or $env:ELECTRON_RUN_AS_NODE -or $env:ELECTRON_FORCE_IS_PACKAGED) { throw 'Refusing inherited Node/Electron overrides' }
+          if ($PSVersionTable.PSVersion.Major -ne 7 -or -not [Environment]::Is64BitProcess) { throw 'pwsh 7 64-bit required' }
+          New-Item -ItemType Directory -Path $root | Out-Null
+          foreach ($d in @('c', 'd', 'h')) { New-Item -ItemType Directory -Path (Join-Path $root $d) | Out-Null }
+          $volume = Get-Volume -DriveLetter ([IO.Path]::GetPathRoot($root).Substring(0, 1))
+          if ($volume.FileSystem -ne 'NTFS') { throw 'Private root requires measured NTFS' }
+          "SABLE_PRIVATE_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SABLE_PUBLIC_OUT=$out" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          @{ classification = 'PUBLIC'; fileSystem = $volume.FileSystem; rootLength = $root.Length; image = $env:ImageOS; imageVersion = $env:ImageVersion } | ConvertTo-Json -Compress
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        id: checkout
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        id: node
+        with:
+          node-version: 24.22.0
+          package-manager-cache: false
+      - name: Frozen reviewed core and Windows gate; record rehearsal source hashes
+        id: gates
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Whitespace/source diff error' }
+          & git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-policy-sqlite/policy.cjs experiments/update-auth-policy-sqlite/store.cjs experiments/update-auth-policy-sqlite/test.cjs experiments/update-auth-policy-sqlite/run-unit.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Reviewed core changed' }
+          & git diff --exit-code a5ea2b6 -- experiments/update-auth-windows
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen Windows gate changed' }
+          & git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-sqlite
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen SQLite capability source changed' }
+          $files = & git ls-files experiments/sable-real-windows experiments/gerar-patch-desktop-update.mjs .github/workflows/sable-real-check.yml .github/workflows/sable-real-windows.yml
+          $hashes = @($files | ForEach-Object { @{ path = $_; sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $_).Hash.ToLowerInvariant() } })
+          $hashes | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $env:SABLE_PRIVATE_ROOT 'h\source-before.json')
+          "head=$(& git rev-parse HEAD) files=$($hashes.Count)"
+      - name: Toolchain preflight (Node 24.22.0 x64, pwsh 7, openssl present; WSL status measured only)
+        id: toolchain
+        run: |
+          & node experiments/sable-real-windows/ci/windows-steps.mjs toolchain
+          if ($LASTEXITCODE -ne 0) { throw 'Toolchain preflight failed; nothing installed' }
+      - name: Parse every PowerShell script of lib/windows.mjs (AST only, not executed)
+        id: psparse
+        run: |
+          & node experiments/sable-real-windows/ci/windows-steps.mjs ps-parse --output-dir (Join-Path $env:SABLE_PRIVATE_ROOT 'ps')
+          if ($LASTEXITCODE -ne 0) { throw 'PowerShell parse errors' }
+      - name: Download the sealed input without credentials; size and SHA256 checked before decryption
+        id: cipher
+        env:
+          SABLE_CIPHER_URL: ${{ inputs.cipher_url }}
+          SABLE_CIPHER_SHA256: ${{ inputs.cipher_sha256 }}
+          SABLE_CIPHER_SIZE: ${{ inputs.cipher_size }}
+        run: |
+          & node experiments/sable-real-windows/ci/fetch-inputs.mjs cipher --url $env:SABLE_CIPHER_URL --sha256 $env:SABLE_CIPHER_SHA256 --size $env:SABLE_CIPHER_SIZE --output (Join-Path $env:SABLE_PRIVATE_ROOT 'c\input.sealed')
+          if ($LASTEXITCODE -ne 0) { throw 'Sealed input download refused' }
+      - name: Decrypt sealed input (key only in this step environment; never argv, GITHUB_ENV, outputs or children)
+        id: decrypt
+        env:
+          SABLE_TEST_INPUT_KEY: ${{ secrets.SABLE_TEST_INPUT_KEY }}
+          SABLE_CIPHER_SHA256: ${{ inputs.cipher_sha256 }}
+          SABLE_CIPHER_SIZE: ${{ inputs.cipher_size }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $blob = Join-Path $env:SABLE_PRIVATE_ROOT 'c\input.sealed'
+          & node experiments/sable-real-windows/ci/sealed-input.mjs open --input $blob --output (Join-Path $env:SABLE_PRIVATE_ROOT 'c\input.tar.gz') --key-env SABLE_TEST_INPUT_KEY --expect-sha256 $env:SABLE_CIPHER_SHA256 --expect-size $env:SABLE_CIPHER_SIZE
+          if ($LASTEXITCODE -ne 0) { throw 'Sealed input refused' }
+          Remove-Item -LiteralPath $blob
+      - name: List and validate every tar entry, extract confined, verify manifest/pins and write recipe.json
+        id: prepare
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $plain = Join-Path $env:SABLE_PRIVATE_ROOT 'c\input.tar.gz'
+          & node experiments/sable-real-windows/ci/prepare-input.mjs --archive $plain --root (Join-Path $env:SABLE_PRIVATE_ROOT 'i')
+          if ($LASTEXITCODE -ne 0) { throw 'Private input refused' }
+          Remove-Item -LiteralPath $plain
+      - name: Download pinned public inputs (Electron 45 zip, WSL rootfs, Synapse wheel via PyPI JSON)
+        id: pinned
+        run: |
+          & node experiments/sable-real-windows/ci/fetch-inputs.mjs pinned --output-dir (Join-Path $env:SABLE_PRIVATE_ROOT 'd')
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned public input refused' }
+      - name: Install pnpm 12.15.0 privately and source dependencies frozen, lifecycle scripts disabled
+        id: install
+        run: |
+          & node experiments/sable-real-windows/ci/windows-steps.mjs install-source --source-root (Join-Path $env:SABLE_PRIVATE_ROOT 'i\source') --tools-dir (Join-Path $env:SABLE_PRIVATE_ROOT 't')
+          if ($LASTEXITCODE -ne 0) { throw 'Source dependency install or verifySource failed' }
+      - name: Run the existing driver; require its literal PASS with every REQUIRED link
+        id: driver
+        run: |
+          $r = $env:SABLE_PRIVATE_ROOT
+          & node experiments/sable-real-windows/driver.mjs --source-root (Join-Path $r 'i\source') --recipe-root (Join-Path $r 'i\recipe') --electron-zip (Join-Path $r 'd\electron-v45.0.0-win32-x64.zip') --wsl-rootfs (Join-Path $r 'd\ubuntu-noble-wsl-amd64-24.04lts.rootfs.tar.gz') --synapse-wheel (Join-Path $r 'd\matrix_synapse-1.162.0-cp310-abi3-manylinux_2_28_x86_64.whl') --out $env:SABLE_PUBLIC_OUT
+          $driverExit = $LASTEXITCODE
+          & node experiments/sable-real-windows/ci/windows-steps.mjs result --out $env:SABLE_PUBLIC_OUT
+          $resultExit = $LASTEXITCODE
+          if ($driverExit -ne 0 -or $resultExit -ne 0) { throw "No Native PASS (driver exit $driverExit); inspect public evidence" }
+      - name: Bounded non-authorizing diagnostic when the driver produced no public output
+        if: always()
+        env:
+          SABLE_STEP_RESERVE: ${{ steps.reserve.outcome }}
+          SABLE_STEP_CHECKOUT: ${{ steps.checkout.outcome }}
+          SABLE_STEP_NODE: ${{ steps.node.outcome }}
+          SABLE_STEP_GATES: ${{ steps.gates.outcome }}
+          SABLE_STEP_TOOLCHAIN: ${{ steps.toolchain.outcome }}
+          SABLE_STEP_PSPARSE: ${{ steps.psparse.outcome }}
+          SABLE_STEP_CIPHER: ${{ steps.cipher.outcome }}
+          SABLE_STEP_DECRYPT: ${{ steps.decrypt.outcome }}
+          SABLE_STEP_PREPARE: ${{ steps.prepare.outcome }}
+          SABLE_STEP_PINNED: ${{ steps.pinned.outcome }}
+          SABLE_STEP_INSTALL: ${{ steps.install.outcome }}
+          SABLE_STEP_DRIVER: ${{ steps.driver.outcome }}
+        run: |
+          if (-not $env:SABLE_PUBLIC_OUT) { throw 'Public output path was never reserved' }
+          & node experiments/sable-real-windows/ci/windows-steps.mjs diagnostic --out $env:SABLE_PUBLIC_OUT
+          if ($LASTEXITCODE -ne 0) { throw 'Diagnostic write failed' }
+      - name: Rehearsal source and frozen gates unchanged after execution
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $before = Get-Content -Raw -LiteralPath (Join-Path $env:SABLE_PRIVATE_ROOT 'h\source-before.json') | ConvertFrom-Json
+          foreach ($record in $before) { if ((Get-FileHash -Algorithm SHA256 -LiteralPath $record.path).Hash.ToLowerInvariant() -ne $record.sha256) { throw "Source changed: $($record.path)" } }
+          & git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-policy-sqlite/policy.cjs experiments/update-auth-policy-sqlite/store.cjs experiments/update-auth-policy-sqlite/test.cjs experiments/update-auth-policy-sqlite/run-unit.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Reviewed core changed during rehearsal' }
+          & git diff --exit-code a5ea2b6 -- experiments/update-auth-windows
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen Windows gate changed during rehearsal' }
+          & git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-sqlite
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen SQLite capability source changed' }
+          $dirty = & git status --porcelain
+          if ($dirty) { throw 'Repository working tree changed during rehearsal' }
+      - name: Enforce the driver public allowlist and 25 MiB bound before upload
+        id: artifact
+        if: always()
+        run: |
+          & node experiments/sable-real-windows/ci/windows-steps.mjs artifact --out $env:SABLE_PUBLIC_OUT
+          if ($LASTEXITCODE -ne 0) { throw 'Public output refused; nothing will be uploaded' }
+      - name: Remove private inputs, toolchain, plaintext source and any leftover driver root
+        if: always()
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $temp = (Resolve-Path -LiteralPath $env:RUNNER_TEMP).Path.TrimEnd('\') + '\'
+          $targets = @(Get-ChildItem -LiteralPath $temp -Directory -Filter 'se-*' | ForEach-Object { $_.FullName })
+          if ($env:SABLE_PRIVATE_ROOT -and (Test-Path -LiteralPath $env:SABLE_PRIVATE_ROOT)) { $targets += (Resolve-Path -LiteralPath $env:SABLE_PRIVATE_ROOT).Path }
+          foreach ($target in $targets) {
+            if (-not $target.StartsWith($temp, [StringComparison]::OrdinalIgnoreCase)) { throw 'Refusing foreign cleanup' }
+            Remove-Item -LiteralPath $target -Recurse -Force
+          }
+      - name: Upload ONLY the audited public evidence; never private inputs, logs, keys or binaries
+        if: always() && steps.artifact.outcome == 'success'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sable-real-public-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/sp-${{ github.run_id }}-${{ github.run_attempt }}/result.json
+            ${{ runner.temp }}/sp-${{ github.run_id }}-${{ github.run_attempt }}/inputs.json
+            ${{ runner.temp }}/sp-${{ github.run_id }}-${{ github.run_attempt }}/build.json
+            ${{ runner.temp }}/sp-${{ github.run_id }}-${{ github.run_attempt }}/synapse.json
+            ${{ runner.temp }}/sp-${{ github.run_id }}-${{ github.run_attempt }}/seed.json
+            ${{ runner.temp }}/sp-${{ github.run_id }}-${{ github.run_attempt }}/negative.json
+            ${{ runner.temp }}/sp-${{ github.run_id }}-${{ github.run_attempt }}/update.json
+            ${{ runner.temp }}/sp-${{ github.run_id }}-${{ github.run_attempt }}/chain.json
+            ${{ runner.temp }}/sp-${{ github.run_id }}-${{ github.run_attempt }}/installed.json
+            ${{ runner.temp }}/sp-${{ github.run_id }}-${{ github.run_attempt }}/restore.json
+            ${{ runner.temp }}/sp-${{ github.run_id }}-${{ github.run_attempt }}/diagnostics.json
+            ${{ runner.temp }}/sp-${{ github.run_id }}-${{ github.run_attempt }}/account.png
+          if-no-files-found: error
+          retention-days: 7

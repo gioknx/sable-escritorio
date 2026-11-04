@@ -1,0 +1,81 @@
+name: Sable real - isolated source and pure UNIT checks
+
+# Somente UNIT puro: io.test.mjs lê fonte/provas privadas e não roda aqui (sem skip, sem fonte falsa).
+# Nada aqui é prova Native; o driver fora do Windows deve terminar BLOCKED exit 78.
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'experiments/sable-real-windows/**'
+      - 'experiments/gerar-patch-desktop-update.mjs'
+      - '.github/workflows/sable-real-*.yml'
+  pull_request:
+    paths:
+      - 'experiments/sable-real-windows/**'
+      - 'experiments/gerar-patch-desktop-update.mjs'
+      - '.github/workflows/sable-real-*.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 24.22.0
+          package-manager-cache: false
+      - name: Frozen reviewed core and Windows gate before execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(node -p 'process.version + " " + process.arch')" = 'v24.22.0 x64'
+          evidence="$RUNNER_TEMP/sable-real-source-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir "$evidence"
+          echo "SABLE_REAL_EVIDENCE=$evidence" >> "$GITHUB_ENV"
+          git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-policy-sqlite/{policy,store,test,run-unit}.cjs
+          git diff --exit-code a5ea2b6 -- experiments/update-auth-windows
+          git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-sqlite
+          git ls-files -z experiments/sable-real-windows experiments/gerar-patch-desktop-update.mjs .github/workflows/sable-real-check.yml .github/workflows/sable-real-windows.yml | xargs -0 sha256sum > "$evidence/before.sha256"
+      - name: Syntax, pure/wrapper/sealed-input UNIT and Linux BLOCKED driver, never Native proof
+        shell: bash
+        working-directory: experiments/sable-real-windows
+        run: |
+          set -euo pipefail
+          for file in $(git ls-files '*.mjs' '*.cjs') ../gerar-patch-desktop-update.mjs; do node --check "$file"; done
+          node --test --test-reporter=tap test/pure.test.mjs test/wrapper.test.mjs test/sealed-input.test.mjs test/sealed-input-prepare.test.mjs test/sealed-input-ci.test.mjs | tee "$SABLE_REAL_EVIDENCE/unit.tap"
+          grep -Eq '^# tests [1-9][0-9]*$' "$SABLE_REAL_EVIDENCE/unit.tap"
+          grep -Eq '^# pass [1-9][0-9]*$' "$SABLE_REAL_EVIDENCE/unit.tap"
+          for label in fail cancelled skipped todo; do grep -qx "# $label 0" "$SABLE_REAL_EVIDENCE/unit.tap"; done
+          set +e
+          node driver.mjs --source-root 'C:\s' --recipe-root 'C:\r' --electron-zip 'C:\e.zip' --wsl-rootfs 'C:\w.tar.gz' --synapse-wheel 'C:\x.whl' --out 'C:\o' > "$SABLE_REAL_EVIDENCE/driver.json"
+          status=$?
+          set -e
+          test "$status" -eq 78
+          node -e 'const r=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")); if (r.status!=="BLOCKED"||r.nativeAuthorization!==false||r.argumentProblems.length) process.exit(1)' "$SABLE_REAL_EVIDENCE/driver.json"
+      - name: Workflow lint when actionlint is already installed (no installation)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if command -v actionlint >/dev/null; then
+            actionlint .github/workflows/sable-real-check.yml .github/workflows/sable-real-windows.yml
+          else
+            echo 'actionlint unavailable on this runner; no installation performed'
+          fi
+          git diff --check
+      - name: Source immutability after execution, including on test failure
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum --check --quiet "$SABLE_REAL_EVIDENCE/before.sha256"
+          git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-policy-sqlite/{policy,store,test,run-unit}.cjs
+          git diff --exit-code a5ea2b6 -- experiments/update-auth-windows
+          git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-sqlite
+          test -z "$(git status --porcelain)"
