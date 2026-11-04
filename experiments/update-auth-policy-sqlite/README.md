@@ -1,8 +1,9 @@
-# Policy + SQLite: candidato isolado, somente core e UNIT
+# Policy + SQLite: core isolado e coletor Native preparado
 
 Esta fatia **não integra** `AuthenticatedNsisUpdater`, app, NSIS ou produção.
-Não existe driver/coletor Native neste diretório. Policy + store **ainda não
-foram executados no Electron/Windows Native**. PASS de UNIT/Node não autoriza
+O core aprovado permanece inalterado. Driver/coletor Native e workflows estão
+preparados, mas Policy + store **ainda NÃO foram executados no Electron/Windows
+Native nesta entrega e NÃO têm Native PASS**. PASS de UNIT/Node não autoriza
 Native PASS, ativação ou instalação. O canário SQLite de outro experimento não
 certifica esta Policy.
 
@@ -12,7 +13,8 @@ certifica esta Policy.
 `../update-auth-windows/update-auth.cjs`. Os helpers de validação, `decode`,
 metadados congelados/WeakMap, `guard` e `rehash` preservam as regras desse núcleo.
 Não há clock, expiração ou freshness novos, nem API preexistente `verifyEnvelope`.
-Nenhum updater, download de instalador ou lançamento de processo é integrado.
+Nenhum updater, download de instalador ou lançamento de instalador é integrado.
+O novo coletor lança somente o runtime Electron pinado para medir este núcleo.
 
 Pré-requisitos: Node 24 com `node:sqlite` builtin e SQLite **>= 3.51.3**;
 instalação já existente de SemVer **7.7.3**, fixada por
@@ -100,13 +102,16 @@ caminho operacional. Sidecar ausente após close normal **não é corrupção**.
 Da raiz do repositório:
 
 ```sh
-for f in policy store test run-unit; do
+for f in policy store test run-unit electron-main driver native.test; do
   node --check experiments/update-auth-policy-sqlite/$f.cjs || exit 1
 done
+node --test --test-reporter=tap experiments/update-auth-policy-sqlite/native.test.cjs
 node experiments/update-auth-policy-sqlite/run-unit.cjs
 node experiments/update-auth-windows/run-unit.cjs
 node --test experiments/update-auth-sqlite/probe.test.cjs
+actionlint .github/workflows/policy-sqlite-check.yml .github/workflows/policy-sqlite-windows.yml
 git diff --check
+git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-policy-sqlite/{policy,store,test,run-unit}.cjs
 git diff --exit-code a5ea2b6 -- experiments/update-auth-windows
 ```
 
@@ -140,6 +145,105 @@ fontes executadas e registra runtime e transcrição nova, não consome recibos
 antigos. Hashes/versões/resultados medidos ficam no recibo da execução, não em
 valores manuais congelados neste README.
 
+## Coletor Native preparado, ainda não executado
+
+`driver.cjs` é um orquestrador Node **assíncrono**, não um proxy que permita
+Node certificar Electron. Sua CLI aceita somente `--electron` e `--out`.
+Fora de Windows x64 retorna `BLOCKED`, exit 78 e `nativeElectron:false`, sem
+criar output ou lançar Electron. Imports Node do main e do driver são inertes.
+
+Uma coleta futura autorizada requer `RUNNER_TEMP` físico, OpenSSL e PowerShell
+`pwsh` disponíveis, runtime oficial em `<RUNNER_TEMP>/runtime/electron/electron.exe`
+e seu ZIP em `<RUNNER_TEMP>/runtime/electron.zip`. O output deve ser um diretório
+**ainda ausente**, estritamente dentro de RUNNER_TEMP, fora do checkout e separado
+do runtime. Exemplo (não executado nesta entrega):
+
+```sh
+node experiments/update-auth-policy-sqlite/driver.cjs --electron <RUNNER_TEMP>/runtime/electron/electron.exe --out <RUNNER_TEMP>/policy-public-novo
+```
+
+O SHA256 do ZIP oficial Electron 45.0.0 win32/x64 é pinado no driver/workflow;
+não se confia apenas na string de versão. O driver também lê a entrada única
+`electron.exe` do ZIP com a API ZIP nativa do PowerShell e exige igualdade do hash
+com o executável fornecido. URL e pins de actions são os mesmos já usados pelo
+experimento SQLite de capacidade. Nenhum Electron é baixado pelo driver.
+
+O driver copia `policy.cjs`, `store.cjs`, `electron-main.cjs`, o controle startup
+existente e **todos** os arquivos do SemVer 7.7.3 em árvore física sem links.
+O layout preserva `../update-auth-windows/node_modules/semver`. Inventário completo
+com tamanhos/hashes mede os bytes reais copiados, inclusive LF/CRLF, sem hash
+obsoleto manual. Originais e cópias são conferidos antes/depois. Cada processo
+Native confere o inventário, caminhos efetivamente carregados, exe/hash, nonce,
+argv e runtime real `process.type=browser`, Electron 45.0.0 win32/x64. Só após
+`app.whenReady()` faz preflight SQLite em memória (>=3.51.3) e executa a Policy
+real. Esse SELECT de versão **não** representa readbacks da conexão privada:
+o recibo atribui corretamente WAL/FULL/EXCLUSIVE/busy1000 às asserções do Store
+aprovado e hasheado, sem inventar valores exportados.
+
+Antes de qualquer fase SQLite há dois controles independentes do
+`../update-auth-sqlite/startup-control.cjs`, com o mesmo exe, allowlist e logging
+(com CA e sem CA). Exigem READY/app-ready, hash/nonce/argv/PID correspondente e
+exit normal. O parser aceita apenas argv ordinário ou o prefixo exato
+`--enable-logging=file` e `--log-file=<log derivado>`; nenhum switch desconhecido
+ou `--no-sandbox`. Flags consumidas pelo default_app têm apenas essa variante
+explicitamente permitida. NODE_OPTIONS, ELECTRON_RUN_AS_NODE, tokens e bypass TLS
+não são herdados. A única adição ao env allowlisted é a CA pública própria,
+exceto no teste TLS negativo.
+
+A matriz futura exige exatamente estas fases, sem skips e com PIDs distintos:
+
+- `init`: HTTPS Ed25519 seq1/v2.2.2, close, leitura do envelope persistido no
+  Electron e `Policy.decode` real, reopen, latest seq2/v2.2.3 e idempotência;
+  freeze/WeakMap/guard forjado conferidos pela Policy.
+- `reopen`: outro processo, seq2, e seis incoming negativos: seq1, seq2
+  conflitante, seq3 com versão menor e igual, assinatura ruim e payload alterado.
+  Após cada rejeição sem retorno de info, um latest válido confirma seq2.
+- `tls-no-ca`: constructor válido, preflight já concluído, fetch rejeitado por
+  código específico de certificado real; falha genérica não conta como esperado.
+- `holder`, `busy`, `after-lock`: constructor mantém conexão exclusiva, READY
+  atômico via fs.watch com deadline, PID comparado ao spawn e depois ao exit real;
+  outro processo deve receber SQLITE_BUSY/code5 dentro do limite; ACK libera e
+  fecha o holder; um terceiro processo reabre e aceita seq2. Não há sleep fixo.
+- Oito fixtures negativas: missing, zero, truncated64, header determinístico,
+  extraSchema, badStoredSig, nonce errado e directory junction real. São clones
+  **após close Native comprovado**; o Node parent prepara/muta somente negativos,
+  verifica precondições e registra `fixtureCreator.runtime=Node` e
+  `positiveEvidence=false`. Cada constructor Native deve rejeitar pelo motivo/código
+  específico e sem reset do DB. Preparar fixture não conta como Policy Native.
+
+`native.test.cjs` testa parsers, imports inertes, env, cópias/semver, arquivos
+reais, watchers/deadlines, fixtures e validadores de recibos/matriz. Seus PIDs e
+recibos sintéticos são explicitamente **UNIT, não Native**. Em Linux, symlink de
+diretório não é certificado de junction NTFS. Não há SQLite mock, monkeypatch de
+FS, execução Windows, fallback ou recibo Native fabricado nesta suíte.
+
+### Evidência pública e workflows
+
+`<out>/result.json` só pode declarar Native PASS após todos os casos exatos,
+preflights, códigos, exit/signal/deadlines, fontes, paths, nonces e PIDs conferidos.
+Recibos/config/checkpoints são arquivos regulares bounded (64 KiB); summary até
+512 KiB; stdout/stderr e logs Chromium preservados até 64 KiB por arquivo após
+close, inclusive em erro. Registros antigos nunca são reutilizados/sobrescritos.
+A árvore contém inventário, original HEAD, perfis isolados e diagnósticos por fase.
+
+**Classificação PUBLIC:** chaves Ed25519 públicas, certificados públicos,
+envelopes assinados/fixtures, fontes/semver, hashes, caminhos efêmeros, PIDs e
+logs bounded. A chave Ed25519 privada só existe na memória do parent; a chave
+TLS privada fica em diretório temporário separado, **fora de out**, removido no
+finally. Nenhuma configuração Native recebe PEM privado. Nenhum token é passado
+ou registrado; o upload inclui somente a árvore pública derivada do ensaio.
+
+`.github/workflows/policy-sqlite-check.yml`: Ubuntu manual/push/PR por paths,
+Node 24, `npm ci --ignore-scripts` só das dependências já lockadas, sete syntax
+checks, UNIT do core/baselines/coletor, actionlint se disponível, hashes e
+comparações do core aprovado/Gate0 antes e depois; logs públicos separados.
+`.github/workflows/policy-sqlite-windows.yml`: **somente manual**, mede NTFS,
+baixa o ZIP oficial pinado, instala as deps lockadas sem scripts, roda o driver,
+falha em BLOCKED/ERROR/Nativefalse e faz upload-always somente de out público.
+Permissões contents:read; sem credenciais de produção, publicação ou instalação.
+Os workflows **não foram despachados** nesta entrega. O PASS da coleta futura
+continua pendente de execução Windows e revisão de seus recibos reais.
+
 ## Ameaças e limites obrigatórios
 
 - A árvore dedicada pertence exclusivamente ao ensaio: sem mutação adversarial
@@ -155,8 +259,9 @@ valores manuais congelados neste README.
   provam durabilidade sob power loss, crash nem semântica universal de disco.
   Não há claim de segurança contra administrador/usuário que controla a árvore
   ou memória do processo, nem contra trocas concorrentes dos arquivos.
-- Esta entrega não executa Native Policy+store, não cria driver/coletor Native,
-  não testa NTFS, download, Authenticode, NSIS, instalação, produção ou ativação.
+- Esta entrega prepara driver/coletor Native, mas não executa Native Policy+store
+  nem Windows/workflows. Não certifica NTFS, download de instalador, Authenticode,
+  NSIS, instalação, produção ou ativação.
   Nada nesta suíte transforma o canário Native de outro experimento em aceite
   desta Policy. A baseline permanece congelada, inclusive seu fsync de diretório
   e eventual EPERM no Windows: nenhum erro foi suprimido ou corrigido nela.
