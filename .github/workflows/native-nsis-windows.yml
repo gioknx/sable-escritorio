@@ -1,0 +1,164 @@
+name: Native NSIS - manual disposable Windows collection
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  native-nsis:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    env:
+      ELECTRON_VERSION: 45.0.0
+      ELECTRON_ARCHIVE_SHA256: ae53887a23bb640369c93dbd38c408a2af5c0deb86f2fa76c6c244cb444b7f47
+    steps:
+      - name: Reserve isolated runtime paths; public output must remain absent for driver exclusivity
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP "nsis-runtime-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $out = Join-Path $env:RUNNER_TEMP "nsis-public-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $root | Out-Null
+          if (Test-Path -LiteralPath $out) { throw 'Refusing existing public output' }
+          "NSIS_NATIVE_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "NSIS_NATIVE_OUT=$out" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $drive = [IO.Path]::GetPathRoot($root).Substring(0, 1)
+          $volume = Get-Volume -DriveLetter $drive
+          @{classification='PUBLIC'; fileSystem=$volume.FileSystem; architecture=$env:PROCESSOR_ARCHITECTURE; scope='Disposable NSIS fixture; not Sable or production auto-update'} | ConvertTo-Json | Set-Content (Join-Path $root 'preflight-public.json')
+          if ($volume.FileSystem -ne 'NTFS') { throw 'Native collection requires measured NTFS' }
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 24.22.0
+          package-manager-cache: false
+      - name: Install existing locked dependencies with lifecycle scripts disabled
+        shell: pwsh
+        run: |
+          & npm ci --ignore-scripts --prefix experiments/update-auth-windows
+          if ($LASTEXITCODE -ne 0) { throw 'Locked dependency install failed' }
+      - name: Verify reviewed core and frozen Windows gate before Native
+        shell: pwsh
+        run: |
+          & git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Whitespace/source diff error' }
+          & git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-policy-sqlite/policy.cjs experiments/update-auth-policy-sqlite/store.cjs experiments/update-auth-policy-sqlite/test.cjs experiments/update-auth-policy-sqlite/run-unit.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Reviewed core changed' }
+          & git diff --exit-code a5ea2b6 -- experiments/update-auth-windows
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen Windows gate changed' }
+          & git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-sqlite
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen SQLite capability source changed' }
+          $files = & git ls-files experiments/update-auth-native-nsis experiments/update-auth-policy-sqlite experiments/update-auth-windows experiments/update-auth-sqlite .github/workflows/native-nsis-check.yml .github/workflows/native-nsis-windows.yml
+          $hashes = @($files | ForEach-Object { @{path=$_; sha256=(Get-FileHash -Algorithm SHA256 $_).Hash.ToLowerInvariant()} })
+          $hashes | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $env:NSIS_NATIVE_ROOT 'source-before-public.json')
+      - name: Prepare only the authorized pinned official NSIS toolset, without npm/global install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = 'https://github.com/electron-userland/electron-builder-binaries/releases/download/nsis@1.2.1/nsis-bundle-3.12.tar.gz'
+          $pin = '56997fdefe25e7928a1a68b4583d08b240b66cf660234053b20131a74cc082f4'
+          $archive = Join-Path $env:NSIS_NATIVE_ROOT 'nsis-bundle-3.12.tar.gz'
+          & curl.exe --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --retry 2 --max-time 180 --output $archive $url
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned NSIS toolset download failed' }
+          $actual = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($actual -ne $pin) { throw 'NSIS toolset SHA256 mismatch before extraction' }
+          $tool = Join-Path $env:NSIS_NATIVE_ROOT 'nsis-toolset'
+          New-Item -ItemType Directory -Path $tool | Out-Null
+          & tar.exe -xzf $archive -C $tool
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned NSIS toolset extraction failed' }
+          $env:NSISDIR = Join-Path $tool 'nsis-bundle/windows'
+          $compiler = Join-Path $env:NSISDIR 'Bin/makensis.exe'
+          if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) { throw 'Pinned real NSIS binary absent' }
+          $version = & $compiler /VERSION
+          if ($LASTEXITCODE -ne 0 -or -not $version -or $version.Length -gt 1024) { throw 'Pinned NSIS identity/version collection failed' }
+          @{classification='PUBLIC'; executable=$compiler; sha256=(Get-FileHash -Algorithm SHA256 $compiler).Hash.ToLowerInvariant(); version=$version; toolset='1.2.1'; declaredNSIS='3.12'; archiveSha256=$actual; nsisDirectory=$env:NSISDIR; url=$url; image=$env:ImageOS; imageVersion=$env:ImageVersion; source='app-builder-lib26.18.0 out/toolsets/windows.js + util/electronGet.js'} | ConvertTo-Json | Set-Content (Join-Path $env:NSIS_NATIVE_ROOT 'compiler-preflight-public.json')
+          "NSIS_COMPILER=$compiler" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Fetch only the exact official Electron archive
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:NSIS_NATIVE_ROOT 'electron.zip'
+          $url = "https://github.com/electron/electron/releases/download/v$env:ELECTRON_VERSION/electron-v$env:ELECTRON_VERSION-win32-x64.zip"
+          & curl.exe --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --retry 2 --max-time 180 --output $archive $url
+          if ($LASTEXITCODE -ne 0) { throw 'Official Electron download failed' }
+          $digest = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($digest -ne $env:ELECTRON_ARCHIVE_SHA256) { throw 'Official archive SHA256 mismatch' }
+          Expand-Archive -Path $archive -DestinationPath (Join-Path $env:NSIS_NATIVE_ROOT 'electron')
+          $exe = Join-Path $env:NSIS_NATIVE_ROOT 'electron/electron.exe'
+          @{classification='PUBLIC'; version=$env:ELECTRON_VERSION; archive_sha256=$digest; executable_sha256=(Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant(); original_head=(& git rev-parse HEAD)} | ConvertTo-Json | Set-Content (Join-Path $env:NSIS_NATIVE_ROOT 'runtime-download-public.json')
+      - name: Collect authenticated download, NSIS completion and explicit driver reopen
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:NSIS_NATIVE_ROOT 'electron/electron.exe'
+          & node experiments/update-auth-native-nsis/driver.cjs --electron $exe --out $env:NSIS_NATIVE_OUT --compiler $env:NSIS_COMPILER
+          if ($LASTEXITCODE -ne 0) { throw 'Native NSIS collection failed or blocked; inspect public evidence' }
+          $receipt = Get-Content -Raw (Join-Path $env:NSIS_NATIVE_OUT 'result.json') | ConvertFrom-Json
+          if ($receipt.status -ne 'PASS' -or $receipt.nativeElectron -ne $true -or $receipt.installCompleted -ne $true -or $receipt.reopenedByDriver -ne $true) { throw 'No Native NSIS PASS' }
+      - name: Check immutability and preserve bounded public provenance, even on failure
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not (Test-Path -LiteralPath $env:NSIS_NATIVE_OUT)) { New-Item -ItemType Directory -Path $env:NSIS_NATIVE_OUT | Out-Null }
+          foreach ($name in @('preflight-public.json', 'runtime-download-public.json', 'source-before-public.json', 'compiler-preflight-public.json')) {
+            $source = Join-Path $env:NSIS_NATIVE_ROOT $name
+            if (Test-Path -LiteralPath $source) { Copy-Item -LiteralPath $source -Destination (Join-Path $env:NSIS_NATIVE_OUT $name) -ErrorAction Stop }
+          }
+          $before = Get-Content -Raw (Join-Path $env:NSIS_NATIVE_ROOT 'source-before-public.json') | ConvertFrom-Json
+          foreach ($record in $before) { if ((Get-FileHash -Algorithm SHA256 $record.path).Hash.ToLowerInvariant() -ne $record.sha256) { throw "Source changed: $($record.path)" } }
+          & git diff --check
+          if ($LASTEXITCODE -ne 0) { throw 'Whitespace/source diff error' }
+          & git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-policy-sqlite/policy.cjs experiments/update-auth-policy-sqlite/store.cjs experiments/update-auth-policy-sqlite/test.cjs experiments/update-auth-policy-sqlite/run-unit.cjs
+          if ($LASTEXITCODE -ne 0) { throw 'Reviewed core changed during collection' }
+          & git diff --exit-code a5ea2b6 -- experiments/update-auth-windows
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen Windows gate changed during collection' }
+          & git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-sqlite
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen SQLite capability source changed' }
+      - name: Enforce public-only bounded artifact allowlist
+        if: always()
+        shell: pwsh
+        run: |
+          $allowed = @('result.json','source-inventory.json','runtime.json','compiler.json','source-before.json','source-after.json','negative.json','positive.json','reopen.json','control.json','ca.pem','diagnostics.json','preflight-public.json','runtime-download-public.json','source-before-public.json','compiler-preflight-public.json')
+          Get-ChildItem -LiteralPath $env:NSIS_NATIVE_OUT -Recurse -Force | ForEach-Object {
+            if ($_.PSIsContainer -or $_.Name -notin $allowed -or $_.Length -gt 8MB -or ($_.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw "Refusing artifact: $($_.Name)" }
+          }
+      - name: Remove private runtime and toolset archives after copying public provenance
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:NSIS_NATIVE_ROOT -and (Test-Path -LiteralPath $env:NSIS_NATIVE_ROOT)) {
+            $root = (Resolve-Path -LiteralPath $env:NSIS_NATIVE_ROOT).Path
+            $temp = (Resolve-Path -LiteralPath $env:RUNNER_TEMP).Path.TrimEnd('\') + '\'
+            if (-not $root.StartsWith($temp, [StringComparison]::OrdinalIgnoreCase)) { throw 'Refusing foreign cleanup' }
+            Remove-Item -LiteralPath $root -Recurse -Force
+          }
+      - name: Upload ONLY classified public evidence; never private TLS roots or runtime ZIP
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-nsis-public-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/result.json
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/source-inventory.json
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/runtime.json
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/compiler.json
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/source-before.json
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/source-after.json
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/negative.json
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/positive.json
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/reopen.json
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/control.json
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/ca.pem
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/diagnostics.json
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/preflight-public.json
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/runtime-download-public.json
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/source-before-public.json
+            ${{ runner.temp }}/nsis-public-${{ github.run_id }}-${{ github.run_attempt }}/compiler-preflight-public.json
+          if-no-files-found: error
+          retention-days: 7

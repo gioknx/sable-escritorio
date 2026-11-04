@@ -1,0 +1,7 @@
+{
+  "name": "native-nsis-disposable-fixture",
+  "private": true,
+  "version": "2.2.1",
+  "main": "experiments/update-auth-native-nsis/electron-main.cjs",
+  "description": "Disposable assay only; not Sable or a release installer"
+}

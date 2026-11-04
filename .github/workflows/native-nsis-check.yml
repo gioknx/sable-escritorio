@@ -1,0 +1,93 @@
+name: Native NSIS - isolated source and UNIT checks
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'experiments/update-auth-native-nsis/**'
+      - 'experiments/update-auth-policy-sqlite/**'
+      - 'experiments/update-auth-windows/**'
+      - 'experiments/update-auth-sqlite/**'
+      - '.github/workflows/native-nsis-*.yml'
+  pull_request:
+    paths:
+      - 'experiments/update-auth-native-nsis/**'
+      - 'experiments/update-auth-policy-sqlite/**'
+      - 'experiments/update-auth-windows/**'
+      - 'experiments/update-auth-sqlite/**'
+      - '.github/workflows/native-nsis-*.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  source:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 24.22.0
+          package-manager-cache: false
+      - name: Install only the existing locked experiment dependencies, no lifecycle scripts
+        run: npm ci --ignore-scripts --prefix experiments/update-auth-windows
+      - name: Reviewed-source anchors before execution
+        shell: bash
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/nsis-source-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir "$evidence"
+          echo "NSIS_SOURCE_EVIDENCE=$evidence" >> "$GITHUB_ENV"
+          git rev-parse HEAD > "$evidence/head.txt"
+          git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-policy-sqlite/{policy,store,test,run-unit}.cjs
+          git diff --exit-code a5ea2b6 -- experiments/update-auth-windows
+          git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-sqlite
+          git ls-files -z experiments/update-auth-native-nsis experiments/update-auth-policy-sqlite experiments/update-auth-windows experiments/update-auth-sqlite .github/workflows/native-nsis-check.yml .github/workflows/native-nsis-windows.yml | xargs -0 sha256sum > "$evidence/before.sha256"
+      - name: Syntax and real UNIT, never Native proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          for file in update-auth electron-main driver; do
+            node --check "experiments/update-auth-native-nsis/$file.cjs"
+          done
+          node --test --test-reporter=tap experiments/update-auth-native-nsis/native.test.cjs | tee "$NSIS_SOURCE_EVIDENCE/nsis-unit.tap"
+          grep -Eq '^# tests [1-9][0-9]*$' "$NSIS_SOURCE_EVIDENCE/nsis-unit.tap"
+          for label in fail cancelled skipped todo; do grep -qx "# $label 0" "$NSIS_SOURCE_EVIDENCE/nsis-unit.tap"; done
+          for file in policy store test run-unit electron-main driver native.test; do
+            node --check "experiments/update-auth-policy-sqlite/$file.cjs"
+          done
+          node --test --test-reporter=tap experiments/update-auth-policy-sqlite/native.test.cjs | tee "$NSIS_SOURCE_EVIDENCE/native-unit.tap"
+          grep -qx '# tests 12' "$NSIS_SOURCE_EVIDENCE/native-unit.tap"
+          for label in fail cancelled skipped todo; do grep -qx "# $label 0" "$NSIS_SOURCE_EVIDENCE/native-unit.tap"; done
+          node experiments/update-auth-policy-sqlite/run-unit.cjs | tee "$NSIS_SOURCE_EVIDENCE/core-unit.json"
+          node experiments/update-auth-windows/run-unit.cjs | tee "$NSIS_SOURCE_EVIDENCE/baseline-unit.json"
+          node --test --test-reporter=tap experiments/update-auth-sqlite/probe.test.cjs | tee "$NSIS_SOURCE_EVIDENCE/sqlite-unit.tap"
+          grep -qx '# tests 24' "$NSIS_SOURCE_EVIDENCE/sqlite-unit.tap"
+          for label in fail cancelled skipped todo; do grep -qx "# $label 0" "$NSIS_SOURCE_EVIDENCE/sqlite-unit.tap"; done
+          if command -v actionlint >/dev/null; then
+            actionlint .github/workflows/native-nsis-check.yml .github/workflows/native-nsis-windows.yml
+          else
+            echo 'actionlint unavailable on this runner; no installation performed'
+          fi
+          git diff --check
+      - name: Source immutability after execution, including on test failure
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha256sum --check "$NSIS_SOURCE_EVIDENCE/before.sha256"
+          git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-policy-sqlite/{policy,store,test,run-unit}.cjs
+          git diff --exit-code a5ea2b6 -- experiments/update-auth-windows
+          git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-sqlite
+      - name: Preserve public UNIT logs only, not Native evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: native-nsis-unit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/nsis-source-${{ github.run_id }}-${{ github.run_attempt }}/
+          if-no-files-found: error
+          retention-days: 7
