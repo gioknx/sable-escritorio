@@ -72,13 +72,21 @@ export const SQLITE_CHECK_PY = String.raw`
 import json, sqlite3, sys, os
 db, room_id, event_id, user_id, canary = sys.argv[1:6]
 import shutil, tempfile, time
-src = db; tmp = tempfile.mkdtemp(prefix='synapse-ro-'); db = os.path.join(tmp, 'copy.db')
-# WSL1 não suporta os locks do SQLite sobre o arquivo ao vivo; lê-se uma cópia consistente (retenta se pegar escrita no meio).
-for suffix in ('', '-wal', '-shm', '-journal'):
-    if os.path.exists(src + suffix): shutil.copyfile(src + suffix, db + suffix)
-con = sqlite3.connect('file:' + db + '?mode=ro', uri=True)
-row = con.execute('select e.type, j.json from events e join event_json j using(event_id) where e.event_id=? and e.room_id=?', (event_id, room_id)).fetchone()
+src = db
+# WSL1 não suporta os locks do SQLite sobre o arquivo ao vivo: lê-se uma cópia privada. Nunca se copia o -shm (índice de memória
+# compartilhada do arquivo vivo, inconsistente na cópia); o SQLite reconstrói o índice do -wal copiado. Retenta até o evento aparecer.
+row = None; types = {}
+for attempt in range(20):
+    tmp = tempfile.mkdtemp(prefix='synapse-ro-'); db = os.path.join(tmp, 'copy.db')
+    for suffix in ('', '-wal', '-journal'):
+        if os.path.exists(src + suffix): shutil.copyfile(src + suffix, db + suffix)
+    con = sqlite3.connect(db)
+    row = con.execute('select e.type, j.json from events e join event_json j using(event_id) where e.event_id=? and e.room_id=?', (event_id, room_id)).fetchone()
+    if row: break
+    types = dict(con.execute('select type, count(*) from events where room_id=? group by type', (room_id,)).fetchall())
+    if attempt < 19: con.close(); time.sleep(1)
 out = {'eventFound': row is not None}
+if row is None: out['roomEventTypesSeen'] = types
 if row:
     ev = json.loads(row[1]); content = ev.get('content', {})
     out.update(eventType=row[0], hasBody='body' in content, contentAlgorithm=content.get('algorithm'), sender=ev.get('sender'))
