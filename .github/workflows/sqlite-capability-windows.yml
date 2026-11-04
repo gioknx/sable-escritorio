@@ -1,0 +1,68 @@
+name: Electron SQLite capability - isolated Windows
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  capability:
+    runs-on: windows-latest
+    timeout-minutes: 12
+    env:
+      ELECTRON_VERSION: 45.0.0
+      ELECTRON_ARCHIVE_SHA256: ae53887a23bb640369c93dbd38c408a2af5c0deb86f2fa76c6c244cb444b7f47
+    steps:
+      - name: Create isolated directories before any download
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = Join-Path $env:RUNNER_TEMP "sqlite-capability-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          $evidence = Join-Path $env:RUNNER_TEMP "sqlite-evidence-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          New-Item -ItemType Directory -Path $root | Out-Null
+          New-Item -ItemType Directory -Path $evidence | Out-Null
+          "SQLITE_PROBE_ROOT=$root" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "SQLITE_PROBE_EVIDENCE=$evidence" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $drive = [IO.Path]::GetPathRoot($root).Substring(0, 1)
+          $volume = Get-Volume -DriveLetter $drive
+          @{scope='Capability and normal reopen only; no updater, installer or crash proof'; fileSystem=$volume.FileSystem; architecture=$env:PROCESSOR_ARCHITECTURE} | ConvertTo-Json | Set-Content (Join-Path $evidence 'preflight.json')
+          if ($volume.FileSystem -ne 'NTFS') { throw 'Capability requires a measured NTFS volume' }
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 24.22.0
+          package-manager-cache: false
+      - name: Fetch only the exact official Electron binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:SQLITE_PROBE_ROOT 'electron.zip'
+          $url = "https://github.com/electron/electron/releases/download/v$env:ELECTRON_VERSION/electron-v$env:ELECTRON_VERSION-win32-x64.zip"
+          & curl.exe --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --retry 2 --max-time 180 --output $archive $url
+          if ($LASTEXITCODE -ne 0) { throw 'Official Electron download failed' }
+          $digest = (Get-FileHash -Algorithm SHA256 $archive).Hash.ToLowerInvariant()
+          if ($digest -ne $env:ELECTRON_ARCHIVE_SHA256) { throw 'Official Electron archive SHA256 mismatch' }
+          Expand-Archive -Path $archive -DestinationPath (Join-Path $env:SQLITE_PROBE_ROOT 'electron')
+          $exe = Join-Path $env:SQLITE_PROBE_ROOT 'electron/electron.exe'
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw 'Electron executable missing' }
+          @{scope='Official runtime measurement, not a distributed app'; version=$env:ELECTRON_VERSION; archive_sha256=$digest; executable_sha256=(Get-FileHash -Algorithm SHA256 $exe).Hash.ToLowerInvariant()} | ConvertTo-Json | Set-Content (Join-Path $env:SQLITE_PROBE_EVIDENCE 'runtime-download.json')
+      - name: Measure the real main process and reopen in a different process
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $exe = Join-Path $env:SQLITE_PROBE_ROOT 'electron/electron.exe'
+          & node experiments/update-auth-sqlite/driver.cjs --electron $exe --root $env:SQLITE_PROBE_ROOT --out $env:SQLITE_PROBE_EVIDENCE
+          if ($LASTEXITCODE -ne 0) { throw 'Electron SQLite capability failed or blocked; inspect JSON evidence' }
+          $receipt = Get-Content -Raw (Join-Path $env:SQLITE_PROBE_EVIDENCE 'capability.json') | ConvertFrom-Json
+          if ($receipt.status -ne 'PASS') { throw 'No successful native capability receipt' }
+      - name: Preserve only JSON evidence, including blocked results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: electron-sqlite-capability-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/sqlite-evidence-${{ github.run_id }}-${{ github.run_attempt }}/*.json
+          if-no-files-found: error
+          retention-days: 7
