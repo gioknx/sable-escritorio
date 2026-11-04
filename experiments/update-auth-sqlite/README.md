@@ -157,8 +157,33 @@ Capture os hashes da **mesma árvore testada**; não reutilize um recibo de outr
 sha256sum experiments/update-auth-sqlite/{driver,electron-main,probe.test,startup-control}.cjs
 ```
 
-Nenhuma execução Windows foi feita nesta etapa. Testes UNIT usam o SQLite
-builtin do Node e não atestam Electron/Windows.
+Testes UNIT usam o SQLite builtin do Node e não atestam Electron/Windows.
+
+### Prova nativa separada — 04/11/2026
+
+[Run 41799254613](https://github.com/gioknx/sable-escritorio/actions/runs/41799254613),
+fonte `8e712b3ca5036dad4db3823205c1102f9f768988`, terminou com
+`PASS` / `nativeElectron: true` em Windows x64 / NTFS, Electron 45.0.0,
+Node 24.22.0 e SQLite 3.53.4.
+
+| Processo real | PID | Resultado |
+| --- | --- | --- |
+| Controle independente | 7724 | `READY`, `app-ready`, exit 0; `requireMain: false` |
+| Escrita SQLite | 8132 | `PASS`, exit 0 |
+| Reabertura/leitura SQLite | 5016 | `PASS`, exit 0; mesma canary |
+
+Ambas as fases mediram `journal_mode: wal`, `synchronous: 2`,
+`locking_mode: exclusive` e `busy_timeout: 1000`.
+O driver e a conferência posterior verificaram PID/nonce/hash/path/exit e dados
+correspondentes nos dois processos, sem Node-proxy ou simulação de filesystem.
+O hash Windows deste run corresponde exatamente à fonte Git após apenas LF→CRLF.
+O controle observou `require.main !== module` no carregamento real;
+isso não estabelece sozinho a causa histórica das exceções `0x80000003`.
+
+**Prova limitada a capacidade e reabertura normal.** Não houve integração da
+Policy/atualizador, instalação, publicação de aplicativo ou ativação de atualização
+automática. A persistência da canary não certifica autenticação, antirollback,
+concorrência, corrupção, crash, queda de energia ou NSIS.
 As APIs foram consultadas na documentação oficial [Node v24.22.0 SQLite](https://nodejs.org/docs/v24.22.0/api/sqlite.html)
 e [Electron app](https://www.electronjs.org/docs/latest/api/app).
 Este probe **não prova autenticação, antirollback, durabilidade sob falha,
