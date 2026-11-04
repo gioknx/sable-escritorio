@@ -28,6 +28,24 @@ test('UNIT failure diagnostics preserve child error before cleanup and never aut
     assert.equal(execution.stdout.length, 20000, 'diagnostics do not mutate acceptance input');
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
+test('UNIT installer ACK must precede awaiting updater process close', () => {
+  const source = fs.readFileSync(require.resolve('./driver.cjs'), 'utf8');
+  const ack = source.indexOf("fs.writeFileSync(ack, nonce, { flag: 'wx' })");
+  const processClose = source.indexOf('const posExecution = await positive.job.done');
+  assert.ok(ack >= 0 && processClose > ack, 'awaiting A close before ACK can deadlock installer waiting for ACK');
+});
+test('UNIT handshake diagnostics are bounded and non-authorizing', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'nsis-handshake-diagnostics-'));
+  try {
+    fs.mkdirSync(path.join(root, 'handshake'));
+    fs.writeFileSync(path.join(root, 'handshake/ready.json'), JSON.stringify({ status: 'READY', pid: 123 }));
+    fs.writeFileSync(path.join(root, 'handshake/installed.json'), 'x'.repeat(9000));
+    const snapshot = D.diagnosticSnapshot(root, []);
+    assert.equal(snapshot.nativeAuthorization, false);
+    assert.equal(snapshot.handshake['ready.json'].status, 'READY');
+    assert.match(snapshot.handshake['installed.json'].diagnosticReadError, /bounded JSON/);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
 test('UNIT inert imports', () => {
   const r = spawnSync(process.execPath, ['-e', `require(${JSON.stringify(path.join(__dirname, 'driver.cjs'))});require(${JSON.stringify(path.join(__dirname, 'electron-main.cjs'))});require(${JSON.stringify(path.join(__dirname, 'update-auth.cjs'))})`]);
   assert.equal(r.status, 0); assert.equal(r.stdout.length, 0); assert.equal(r.stderr.length, 0);

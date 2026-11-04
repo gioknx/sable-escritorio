@@ -11,6 +11,16 @@ nem usar `ELECTRON_FORCE_IS_PACKAGED`. Electron 45 rejeita `electron.exe` em
 `App::IsPackaged` (fonte oficial abaixo); adicionar resources/app não basta.
 https://raw.githubusercontent.com/electron/electron/v45.0.0/shell/browser/api/electron_api_app.cc
 
+Run `41823259593`: Native confirmou app empacotado, adapter padrão, SQLite,
+rejeição do instalador adulterado e download íntegro de 158 MB. O processo NSIS
+real foi observado por CIM, mas já não existia quando o observador abriu o
+handle. O coletor esperava o fechamento de A **antes** de liberar o ACK; essa
+dependência pode bloquear a instalação até o prazo de 120 s (run: 182 s).
+A correção libera ACK com observador ativo, só depois aguarda/valida o fechamento
+de A; mantém todas as exigências de exit0, arquivos e reabertura. Diagnósticos
+agora também preservam os quatro recibos da instalação, limitados a 8 KiB cada.
+Ainda depende de nova execução Native; nada foi ativado no Sable.
+
 ## Fontes congeladas e delta
 
 - W: `../update-auth-windows/update-auth.cjs`, base `a5ea2b6`.
