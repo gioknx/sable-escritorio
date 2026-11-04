@@ -66,6 +66,7 @@ async function main() {
     const { DatabaseSync } = require('node:sqlite'); const memory = new DatabaseSync(':memory:', { allowExtension: false });
     try { record.sqliteVersion = memory.prepare('SELECT sqlite_version() v').get().v; } finally { memory.close(); }
     assert.ok(require('../update-auth-windows/node_modules/semver').gte(record.sqliteVersion, '3.51.3'));
+    assert.equal(process.env.ELECTRON_FORCE_IS_PACKAGED, undefined, 'no packaged-status override');
     record.isPackaged = app.isPackaged; assert.equal(app.isPackaged, true);
     record.version = app.getVersion(); assert.equal(record.version, args.phase === 'reopen' ? '2.2.3' : '2.2.1');
     record.paths = Object.fromEntries(Object.keys(paths).map(key => [key, app.getPath(key)])); assert.deepEqual(record.paths, paths);
