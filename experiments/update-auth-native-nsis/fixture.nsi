@@ -29,6 +29,7 @@ Section
     SetErrorLevel 4
     Quit
   ack_received:
+  ClearErrors ; Scope IfErrors to SetOutPath/File extraction, not earlier handshake commands.
   SetOutPath "$INSTDIR"
   File /r "${PAYLOAD}\*.*"
   IfErrors failed
@@ -39,6 +40,10 @@ Section
   SetErrorLevel 0
   Goto done
   failed:
+    FileOpen $1 "${INSTALLED}.writing" w
+    FileWrite $1 '{"status":"EXTRACTION_FAILED","nonce":"${NONCE}","pid":$0}'
+    FileClose $1
+    Rename "${INSTALLED}.writing" "${INSTALLED}"
     SetErrorLevel 5
   done:
 SectionEnd
