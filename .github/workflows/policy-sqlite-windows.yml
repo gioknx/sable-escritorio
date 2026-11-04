@@ -48,6 +48,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Reviewed core changed' }
           & git diff --exit-code a5ea2b6 -- experiments/update-auth-windows
           if ($LASTEXITCODE -ne 0) { throw 'Frozen Windows gate changed' }
+          & git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-sqlite
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen SQLite capability source changed' }
           $files = & git ls-files experiments/update-auth-policy-sqlite experiments/update-auth-windows experiments/update-auth-sqlite .github/workflows/policy-sqlite-check.yml .github/workflows/policy-sqlite-windows.yml
           $hashes = @($files | ForEach-Object { @{path=$_; sha256=(Get-FileHash -Algorithm SHA256 $_).Hash.ToLowerInvariant()} })
           $hashes | ConvertTo-Json -Depth 4 | Set-Content (Join-Path $env:POLICY_NATIVE_ROOT 'source-before-public.json')
@@ -89,6 +91,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'Reviewed core changed during collection' }
           & git diff --exit-code a5ea2b6 -- experiments/update-auth-windows
           if ($LASTEXITCODE -ne 0) { throw 'Frozen Windows gate changed during collection' }
+          & git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-sqlite
+          if ($LASTEXITCODE -ne 0) { throw 'Frozen SQLite capability source changed' }
       - name: Upload ONLY classified public evidence; never private TLS roots or runtime ZIP
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

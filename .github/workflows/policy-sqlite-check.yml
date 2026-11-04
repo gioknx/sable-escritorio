@@ -43,6 +43,7 @@ jobs:
           git rev-parse HEAD > "$evidence/head.txt"
           git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-policy-sqlite/{policy,store,test,run-unit}.cjs
           git diff --exit-code a5ea2b6 -- experiments/update-auth-windows
+          git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-sqlite
           git ls-files -z experiments/update-auth-policy-sqlite experiments/update-auth-windows experiments/update-auth-sqlite .github/workflows/policy-sqlite-check.yml .github/workflows/policy-sqlite-windows.yml | xargs -0 sha256sum > "$evidence/before.sha256"
       - name: Syntax and real UNIT, never Native proof
         shell: bash
@@ -73,6 +74,7 @@ jobs:
           sha256sum --check "$POLICY_SOURCE_EVIDENCE/before.sha256"
           git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-policy-sqlite/{policy,store,test,run-unit}.cjs
           git diff --exit-code a5ea2b6 -- experiments/update-auth-windows
+          git diff --exit-code f01a3b97eabfc676e6d46cec62839dd3fda10f27 -- experiments/update-auth-sqlite
       - name: Preserve public UNIT logs only, not Native evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
