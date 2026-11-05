@@ -57,3 +57,20 @@ test('legacy shell path changes a dollar event ID; stdin JSON preserves all iden
   const received = execFileSync('python3', ['-c', 'import json,sys; print(json.dumps(json.load(sys.stdin)))'], { input: JSON.stringify(values), encoding: 'utf8' });
   assert.deepEqual(JSON.parse(received), values);
 });
+
+test('public database diagnostic reports only allowlisted values: private text from any database field never survives', () => {
+  const canary = 'private-query-canary-0123456789abcdef', room = '!private-room', user = '@private-user:escritorio.localhost';
+  const hostile = { eventFound: true, roomEventTypesSeen: { 'm.room.encrypted': 1, [canary]: 2, [room]: 3 },
+    eventType: canary, hasBody: canary, contentAlgorithm: canary, roomEncryption: `${canary}${room}`, sender: user,
+    devices: [user], identifiersMatch: canary, databaseConsistent: canary, canaryPlaintextInDatabase: canary };
+  const text = JSON.stringify(databaseDiagnostic(hostile, { userId: user, deviceId: 'DEV' }));
+  for (const secret of [canary, room, user, '$']) assert.equal(text.includes(secret), false, `${secret} leaked`);
+  const diagnostic = JSON.parse(text);
+  assert.deepEqual(diagnostic.roomEventTypesSeen, { 'm.room.encrypted': 1, other: 5 });
+  assert.deepEqual([diagnostic.eventType, diagnostic.contentAlgorithm, diagnostic.roomEncryption], ['other', 'other', 'other']);
+  assert.deepEqual([diagnostic.hasBody, diagnostic.identifiersMatch, diagnostic.databaseConsistent, diagnostic.canaryPlaintextInDatabase], [null, null, null, null]);
+  const real = databaseDiagnostic({ eventFound: true, roomEventTypesSeen: { 'm.room.encrypted': 1 }, eventType: 'm.room.encrypted', hasBody: false,
+    contentAlgorithm: 'm.megolm.v1.aes-sha2', roomEncryption: 'm.megolm.v1.aes-sha2', identifiersMatch: true, databaseConsistent: true,
+    sender: user, devices: ['DEV'], canaryPlaintextInDatabase: false }, { userId: user, deviceId: 'DEV' });
+  assert.equal(real.eventType, 'm.room.encrypted'); assert.equal(real.contentAlgorithm, 'm.megolm.v1.aes-sha2'); assert.equal(real.senderMatches, true);
+});

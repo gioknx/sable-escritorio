@@ -71,20 +71,31 @@ export async function registerSyntheticAccount(baseUrl, secrets) {
 // Executado pelo python da distro sobre o SQLite real do Synapse sintético. Somente leitura.
 export const SQLITE_CHECK_PY = readFileSync(new URL('./sqlite-check.py', import.meta.url), 'utf8');
 
-// Public diagnostic: no raw identifiers, message, token or key.
+// Public diagnostic: only allowlisted event types/algorithms, booleans and counts. Anything else from the
+// database is reported as 'other' / a count, so server-side text can never reach a public report.
+const PUBLIC_EVENT_TYPES = new Set(['m.room.create', 'm.room.encrypted', 'm.room.encryption', 'm.room.guest_access',
+  'm.room.history_visibility', 'm.room.join_rules', 'm.room.member', 'm.room.message', 'm.room.name', 'm.room.power_levels']);
+const publicType = value => value == null ? null : PUBLIC_EVENT_TYPES.has(value) ? value : 'other';
+const publicAlgorithm = value => value == null ? null : value === 'm.megolm.v1.aes-sha2' ? value : 'other';
+const publicCount = value => Number.isSafeInteger(value) && value >= 0 ? value : 0;
+const publicBool = value => typeof value === 'boolean' ? value : null;
 export function databaseDiagnostic(evidence, { userId, deviceId }) {
+  const types = {};
+  for (const [type, count] of Object.entries(evidence.roomEventTypesSeen ?? {})) {
+    const key = publicType(type); types[key] = publicCount(types[key]) + publicCount(count);
+  }
   return {
-    eventFound: evidence.eventFound,
-    roomEventTypesSeen: evidence.roomEventTypesSeen,
-    eventType: evidence.eventType ?? null,
-    hasBody: evidence.hasBody ?? null,
-    contentAlgorithm: evidence.contentAlgorithm ?? null,
-    roomEncryption: evidence.roomEncryption,
-    identifiersMatch: evidence.identifiersMatch,
-    databaseConsistent: evidence.databaseConsistent,
+    eventFound: publicBool(evidence.eventFound),
+    roomEventTypesSeen: types,
+    eventType: publicType(evidence.eventType),
+    hasBody: publicBool(evidence.hasBody),
+    contentAlgorithm: publicAlgorithm(evidence.contentAlgorithm),
+    roomEncryption: publicAlgorithm(evidence.roomEncryption),
+    identifiersMatch: publicBool(evidence.identifiersMatch),
+    databaseConsistent: publicBool(evidence.databaseConsistent),
     senderMatches: evidence.sender === userId,
     deviceMatches: evidence.devices?.length === 1 && evidence.devices[0] === deviceId,
-    canaryPlaintextInDatabase: evidence.canaryPlaintextInDatabase,
+    canaryPlaintextInDatabase: publicBool(evidence.canaryPlaintextInDatabase),
   };
 }
 
