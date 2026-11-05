@@ -1,6 +1,6 @@
 # Ensaio do Sable real no Windows descartável
 
-Estado: especificação de preparação local; não é prova Native nem ativação.
+Estado: ensaio manual, aprovado uma vez no Windows descartável em 05/11/2026 (ver "Resultado medido" no fim); não é publicação nem ativação.
 Dono: mãe da integração; resultado desejado: instalar a nova versão automaticamente,
 reabrir pelo instalador e restaurar a mesma conta/dispositivo e mensagem decifrada.
 A versão em uso, Ronald e produção não são destinos de teste.
@@ -10,7 +10,7 @@ A versão em uso, Ronald e produção não são destinos de teste.
 Somente esta pasta: fontes/driver, preparo Synapse WSL, helpers de empacotamento,
 testes Node de partes puras, pins/dependências e esta README.
 Não editar CI, AGENTS, patches, perfis ou módulos dos outros operários.
-Sem push, publicação ou execução Windows nesta fatia.
+Sem push, publicação ou execução Windows nesta fatia de preparação (a execução consta no fim).
 Linux deve produzir BLOCKED exit78 no driver Native, nunca PASS simulado.
 Nenhum Stub/TODO, FakeUpdater, pid forjado, override packaged/TLS/sandbox.
 
@@ -232,13 +232,47 @@ Resultado: `--out/result.json` com os 18 elos; ERROR se qualquer um faltar.
 `diagnostics.json` é sempre não autorizante. Público: só a allowlist de
 lib/evidence.mjs, cada escrita e a auditoria final passam pelo secret scan.
 
-Elos ainda não medidos (todos só no Native): build NSIS real e fuses do pacote;
-scripts pwsh; WSL1/Synapse; Core/GUI/CDP; download e hint; X para bandeja; cadeia
-seed->instalador->reabertura; inventário/PE/registro; conta/device/decryption.
-Reabertura via explorer e env herdado: resolvidos em código e UNIT (acima); medir no
-Native qual launchMode ocorre, Authenticode do explorer em pwsh 7, GetOwnerSid/sessão
-reais e a API de CA dentro do Electron 45.
-Limite: as dependências Python do wheel vêm do PyPI sem hash pinado (só binários);
-o `pip freeze` vai para synapse.json. Ubuntu 24.04 sob WSL1 não foi medido.
-Outras hipóteses: número de downloads do SDK no negativo;
-visibilityState 'hidden' após hideToTray.
+Elos medidos no Native em 05/11/2026 (run 41992935052): build NSIS real e fuses, scripts pwsh, WSL1/Synapse,
+Core/GUI/CDP, download e hint, X para bandeja (visibilityState hidden), cadeia seed->instalador->reabertura
+(launchMode nsis-shell-broker), inventário/PE/registro, conta/device/decryption e o negativo de instalador
+adulterado (1 download adulterado rejeitado, hint ausente). Ubuntu 24.04 sob WSL1 funcionou.
+Limite que continua: as dependências Python do wheel vêm do PyPI sem hash pinado (só binários);
+o pip freeze vai para synapse.json.
+
+## Resultado medido e próximo passo (05/11/2026)
+
+Estado: o fluxo completo passou uma vez no Windows descartável do GitHub (run 41992935052, commit 5dd14af
+da branch gio/sable-real-windows-4): PASS, nativeAuthorization true, 18 de 18 elos, sem erro de limpeza.
+Vale para esta versão do ensaio e para a fonte comprovada acima. Não é publicação nem ativação da
+atualização para usuários, não é prova de SSO nem de primeira entrada, e não altera o Sable em uso.
+Rodada única: a repetição na mesma versão ainda não foi medida.
+
+Falhas encontradas e causa (as três eram do roteiro, nenhuma do Sable):
+- A consulta ao banco do Synapse passava os identificadores pela linha de comando do wsl.exe; o identificador
+  do evento começa com $ e o shell da distro o alterava. Agora os parâmetros vão como JSON na entrada padrão
+  para um programa Python privado (lib/sqlite-check.py), conferidos por resumo SHA-256, com instantâneo
+  consistente (processo do Synapse parado só durante a cópia do banco e do WAL, nunca do -shm). Erro de
+  instantâneo, de SQL ou banco incoerente sai com erro e nunca vira "evento ausente".
+- A limpeza tratava como erro o processo que já tinha terminado. Agora processo ausente ou que sumiu durante a
+  parada é normal; acesso negado ou processo ainda vivo continua erro.
+- Aplicar close-to-tray sem useCustomTitleBar fazia o Sable (padrão Windows: barra própria) recriar a janela e
+  derrubar a página CDP do roteiro. O roteiro agora mantém a barra própria.
+
+Checagem curta: workflow sable-real-windows.yml com mode=query roda só Synapse real, evento cifrado conhecido
+(libolm 3.2.15, hash pinado) e a consulta, sem Sable, compilação ou instalação, e termina QUERY_CHECKED, nunca
+aprovação da atualização. Prova (run 41990595436): o caminho antigo reproduz a perda do identificador; o novo
+preserva; evento presente passa; ausente, identificador alterado, texto claro e banco incoerente reprovam. As
+condições de limpeza "processo já saiu" e "acesso negado/ainda vivo" usam substitutos do Stop-Process; a
+ausência real de PID foi medida. O modo full continua sendo o padrão e o único que autoriza.
+
+Tempos medidos (horários dos passos): completo aprovado 4m50s no total, 3m55s no driver: compilação 2m06s,
+Synapse 52s, instalação do seed 16s, atualização e validação cerca de 24s. Checagem curta 3m26s, dominada pelo
+Synapse sob WSL1 (147s). As rodadas anteriores falhavam depois de 5 a 7 minutos; o ganho vem de isolar a falha e
+corrigir na branch, não de acelerar o fluxo. Sem cache nesta entrega.
+
+Fonte de manutenção e cópia de execução: sable/desktop-windows-test (fonte) e experiments/sable-real-windows
+(cópia no repo sable-escritorio) são idênticas, incluindo ci/. Única exceção de execução:
+test/sealed-input-ci.test.mjs lê .github/workflows e só roda na cópia do repo.
+
+Próximo passo (decisão de produto, fora deste ensaio): integrar o ensaio à main do sable-escritorio e, em
+separado, decidir quando a atualização automática passa a valer para usuários.
