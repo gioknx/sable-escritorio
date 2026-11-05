@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 // Stage-one diagnostic only: real Synapse + libolm on the existing disposable WSL1.
 // No Sable source, build, install or updater authorization. No private output uploaded.
-import assert from 'node:assert/strict';
+// Failures carry a fixed code only: values compared here may be identifiers or the private canary.
+export class QueryFailure extends Error { constructor(code) { super(code); this.code = code; } }
+const must = (ok, code) => { if (!ok) throw new QueryFailure(code); };
+export const publicReason = error => error instanceof QueryFailure ? error.code : `unexpected:${String(error?.code ?? error?.name ?? 'error').replace(/[^A-Za-z0-9_.-]/g, '').slice(0, 48)}`;
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { randomBytes } from 'node:crypto';
@@ -38,7 +41,7 @@ async function ready(child) {
 async function cleanupTests(root) {
   // The real process-disappeared case, including the race between CIM and Stop-Process.
   const env = { ...process.env, ENSAIO_ROOT: root + '\\', ENSAIO_PIDS: '2147483646' };
-  assert.deepEqual(await pwshJson(PS.stopOwned, env), []);
+  must(JSON.stringify(await pwshJson(PS.stopOwned, env)) === '[]', 'cleanup-absent-pid');
   const tests = [
     { name: 'already-exited-race', stop: "$PSCmdlet.ThrowTerminatingError([Management.Automation.ErrorRecord]::new([Exception]::new('gone'),'gone',[Management.Automation.ErrorCategory]::ObjectNotFound,$null))", remaining: '$null', fails: false },
     { name: 'access-denied', stop: "$PSCmdlet.ThrowTerminatingError([Management.Automation.ErrorRecord]::new([UnauthorizedAccessException]::new('denied'),'denied',[Management.Automation.ErrorCategory]::PermissionDenied,$null))", remaining: '$null', fails: true },
@@ -48,7 +51,7 @@ async function cleanupTests(root) {
     const prefix = `function Get-CimInstance { param($ClassName,$Filter) $script:queries++; if($script:queries -eq 1){ [pscustomobject]@{ExecutablePath=$env:ENSAIO_ROOT+'owned.exe'} } else { ${t.remaining} } }\nfunction Stop-Process { [CmdletBinding()]param($Id,[switch]$Force) ${t.stop} }\n$script:queries=0;\n`;
     let failed = false;
     try { await pwsh(prefix + PS.stopOwned, env, 20000); } catch { failed = true; }
-    assert.equal(failed, t.fails, t.name);
+    must(failed === t.fails, `cleanup-${t.name}`);
   }
   return { absentPid: true, exitedRace: true, accessDeniedRejected: true, stillAliveRejected: true };
 }
@@ -101,46 +104,46 @@ export async function queryOnly() {
     try {
       outbound.create(); identity.create(); inbound.create(outbound.session_key());
       ciphertext = outbound.encrypt(JSON.stringify({ room_id: roomId, type: 'm.room.message', content: { msgtype: 'm.text', body: canary } }));
-      assert.equal(JSON.parse(inbound.decrypt(ciphertext).plaintext).content.body, canary);
+      must(JSON.parse(inbound.decrypt(ciphertext).plaintext).content.body === canary, 'olm-roundtrip');
       sessionId = outbound.session_id(); senderKey = JSON.parse(identity.identity_keys()).curve25519;
     } finally { outbound.free(); inbound.free(); identity.free(); }
     const send = (type, content) => api(`rooms/${encodeURIComponent(roomId)}/send/${type}/${randomBytes(6).toString('hex')}`, content, 'PUT');
     const { event_id: eventId } = await send('m.room.encrypted', { algorithm: 'm.megolm.v1.aes-sha2', ciphertext, session_id: sessionId, sender_key: senderKey, device_id: 'QUERY_DEVICE' });
-    assert.ok(eventId.startsWith('$'));
+    must(eventId.startsWith('$'), 'event-id-shape');
     const expected = { userId: account.userId, deviceId: 'QUERY_DEVICE' };
     const values = [roomId, eventId, account.userId, "space quote ' dollar $ backslash \\ Unicode ç"];
     const oldReceived = await transportProbe(distro, values.slice(0, 3), env, true);
-    assert.notDeepEqual(oldReceived, values.slice(0, 3), 'legacy Windows/WSL transport must reproduce identifier loss');
-    assert.deepEqual(await transportProbe(distro, values, env), values);
+    must(JSON.stringify(oldReceived) !== JSON.stringify(values.slice(0, 3)), 'legacy-transport-not-reproduced');
+    must(JSON.stringify(await transportProbe(distro, values, env)) === JSON.stringify(values), 'json-transport-changed-values');
     report.checks.transportLegacyReproduced = true; report.checks.transportJsonPreserved = true;
     const query = (id = eventId, options) => querySqlite(distro, SQLITE_CHECK_PY, [roomId, id, account.userId, canary], env, options);
     const present = await query();
     report.present = databaseDiagnostic(present, expected); // record before validating
-    assert.equal(validateDatabaseEvidence(present, expected).ok, true, JSON.stringify(report.present));
+    must(validateDatabaseEvidence(present, expected).ok === true, 'present-event-rejected');
     report.checks.encryptedEventPresent = true;
     for (const [label, id] of [['absent', '$absent-query-event'], ['changed', eventId.slice(1)]]) {
       const result = await query(id);
       report[label] = databaseDiagnostic(result, expected);
-      assert.equal(result.eventFound, false);
-      assert.equal(validateDatabaseEvidence(result, expected).ok, false);
+      must(result.eventFound === false, `${label}-event-found`);
+      must(validateDatabaseEvidence(result, expected).ok === false, `${label}-accepted`);
       report.checks[label + 'Rejected'] = true;
     }
     const { event_id: plainId } = await send('m.room.message', { msgtype: 'm.text', body: 'negative plaintext, not the private canary' });
     const plain = await query(plainId); report.plain = databaseDiagnostic(plain, expected);
-    assert.equal(plain.eventFound, true); assert.equal(plain.hasBody, true);
-    assert.equal(validateDatabaseEvidence(plain, expected).ok, false); report.checks.plaintextRejected = true;
+    must(plain.eventFound === true && plain.hasBody === true, 'plaintext-control-missing');
+    must(validateDatabaseEvidence(plain, expected).ok === false, 'plaintext-accepted'); report.checks.plaintextRejected = true;
     // Damage only a separate private snapshot, never the live server database.
     await makeInconsistentCopy(distro, eventId, env);
     let inconsistentRejected = false;
     try { await query(eventId, { database: `${DATA}/negative.db` }); } catch { inconsistentRejected = true; }
-    assert.equal(inconsistentRejected, true, 'inconsistent database copy must fail, not become absence');
+    must(inconsistentRejected === true, 'inconsistent-copy-accepted');
     report.checks.inconsistentRejected = true;
     report.checks.cleanup = await cleanupTests(root);
     report.timings.queryMs = Date.now() - started;
   } catch (error) {
     report.status = 'ERROR';
-    // Assertion messages contain only the bounded diagnostic above. Never attach raw commands or server logs.
-    report.reason = error instanceof assert.AssertionError ? String(error.message).slice(0, 512) : String(error.code ?? error.name);
+    // The public reason is a fixed code. Never attach compared values, raw commands or server logs.
+    report.reason = publicReason(error);
     throw Object.assign(new Error('query-only diagnostic failed'), { report });
   } finally {
     if (hosts) try { await pwsh(PS.hostsRemove, { ...env, ENSAIO_NONCE: nonce }); } catch { cleanupErrors.push('hosts'); }
