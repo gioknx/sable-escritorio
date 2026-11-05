@@ -129,6 +129,18 @@ test('process chain rejects wrong parent, signer, SID, session, args, timing, dr
   bad([firstSeed, { ...seedRow, commandLine: `"${app}" --updated` }, installerRow, reopenedRow], /seed not observed with genuine/);
 });
 
+test('process chain: a PID reused after an exited driver child is not the driver; within the child lifetime it still is', () => {
+  const rows = [firstSeed, seedRow, installerRow, reopenedRow];
+  const spawns = until => ({ driverSpawns: [...options().driverSpawns, { pid: 200, image: 'C:\\Windows\\System32\\wsl.exe', at: at(2), ...(until ? { until } : {}) },
+    { pid: 300, image: 'C:\\Windows\\System32\\wsl.exe', at: at(2), ...(until ? { until } : {}) }] });
+  assert.deepEqual(chain(rows, exitsOk(), spawns(at(5))).problems, []);          // exited before the installer / reopened app were created
+  assert.match(chain(rows, exitsOk(), spawns()).problems.join('|'), /installer pid was spawned by driver/);          // no recorded exit: conservative
+  assert.match(chain(rows, exitsOk(), spawns(at(13))).problems.join('|'), /installer pid was spawned by driver/);    // alive when the installer was created
+  assert.match(chain(rows, exitsOk(), spawns(at(25))).problems.join('|'), /reopened pid not new/);
+  const early = { driverSpawns: [...options().driverSpawns, { pid: 200, image: 'C:\\x.exe', at: at(15), until: at(30) }] };       // spawned after the installer began: other process
+  assert.deepEqual(chain(rows, exitsOk(), early).problems, []);
+});
+
 test('watcher log: partial last line ignored, exits mapped with OS exit time', () => {
   const { rows, exits } = parseWatcherLog('{"kind":"process","pid":1}\r\n{"kind":"exit","pid":1,"exitCode":0,"exitedAt":"x"}\n{"kind":"proc');
   assert.equal(rows.length, 1); assert.deepEqual(exits.get(1), { exitCode: 0, exitedAt: 'x' });

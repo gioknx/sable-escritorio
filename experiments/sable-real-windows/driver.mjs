@@ -47,7 +47,9 @@ const spawned = [];
 function own(exe, args, env, live) {
   const at = new Date().toISOString();
   const child = spawn(exe, args, { env, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  spawned.push({ pid: child.pid ?? null, image: exe, at });
+  const spawnRecord = { pid: child.pid ?? null, image: exe, at };
+  spawned.push(spawnRecord);
+  child.once('exit', () => { spawnRecord.until = new Date().toISOString(); });
   const record = { pid: child.pid ?? null, exitCode: undefined, signal: null, stderrTail: '' };
   child.stdout.resume();
   child.stderr.on('data', b => { record.stderrTail = (record.stderrTail + b.toString('utf8')).slice(-4096); });
@@ -324,7 +326,7 @@ export async function main(argv = process.argv.slice(2), platform = process.plat
       reopened: { pid: chain.reopened.pid, parent: chain.reopened.parent, created: chain.reopened.created, commandLine: chain.reopened.commandLine,
         sha256: chain.reopened.sha256, sid: chain.reopened.sid, sessionId: chain.reopened.sessionId },
       parentFacts: chain.launchMode === 'nsis-shell-broker' ? chain.reopened.parentFacts : null,
-      driverSpawns: spawned.map(s => ({ pid: s.pid, image: win32.basename(s.image), at: s.at })) });
+      driverSpawns: spawned.map(s => ({ pid: s.pid, image: win32.basename(s.image), at: s.at, until: s.until ?? null })) });
     report.launchMode = chain.launchMode; // 'direct' ou 'nsis-shell-broker'; broker é correlação via shell, não pai direto.
     checks.installerChain = true;
     if (installerExit?.exitCode !== 0) throw new Error(`installer exit ${installerExit?.exitCode}`);
