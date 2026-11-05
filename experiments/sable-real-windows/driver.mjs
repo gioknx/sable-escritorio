@@ -273,7 +273,8 @@ export async function main(argv = process.argv.slice(2), platform = process.plat
     checks.updateDownloadedHint = true;
 
     step('close-to-tray');
-    const tray = await electronCall(coreA, 'applyWindowSettings', [{ closeToTray: true, minimizeToTray: false, showSystemTrayIcon: true }]);
+    // Keep the genuine Windows default (custom title bar): omitting it makes the app recreate its window and drop the CDP page.
+    const tray = await electronCall(coreA, 'applyWindowSettings', [{ closeToTray: true, minimizeToTray: false, showSystemTrayIcon: true, useCustomTitleBar: true }]);
     if (tray.ok?.trayAvailable !== true) throw new Error('tray unavailable');
     // Bounded, non-authorizing observation of the failing hide step: no URLs with paths, ids, messages or logs.
     const observeClose = async (error) => {

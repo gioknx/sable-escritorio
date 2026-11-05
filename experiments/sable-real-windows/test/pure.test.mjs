@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { readFileSync } from 'node:fs';
 import { decide, REQUIRED } from '../lib/verdict.mjs';
 import { allowlistEnv, appEnv, parseArgs, pathPreflight } from '../lib/guards.mjs';
 import { splitWindowsCommandLine, validateInstallerCommand, validateProcessChain } from '../lib/nsis.mjs';
@@ -149,4 +150,11 @@ test('timeline: VectorDiff application and remote-confirmed canary (local echo r
 test('wsl: drvfs path', () => {
   assert.equal(mntPath('D:\\a\\_temp\\se-x\\w.whl'), '/mnt/d/a/_temp/se-x/w.whl');
   assert.throws(() => mntPath('\\\\server\\share\\x'), /drive-absolute/);
+});
+
+test('close-to-tray settings keep the genuine Windows title bar so the app does not recreate its window', () => {
+  const source = readFileSync(new URL('../driver.mjs', import.meta.url), 'utf8');
+  const call = source.split('\n').find(l => l.includes("'applyWindowSettings'"));
+  assert.ok(call, 'driver applies window settings');
+  assert.match(call, /useCustomTitleBar: true/);
 });
