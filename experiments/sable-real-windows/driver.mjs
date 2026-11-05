@@ -18,7 +18,7 @@ import { allowlistEnv, appEnv, parseArgs, pathPreflight } from './lib/guards.mjs
 import { compareInventory, hashFile, inventory } from './lib/inventory.mjs';
 import { validateProcessChain } from './lib/nsis.mjs';
 import { ELECTRON, IDENTIFIER, PRODUCT_EXE, SYNAPSE, VERSIONS, WSL_ROOTFS } from './lib/pins.mjs';
-import { SQLITE_CHECK_PY, generateSecrets, homeserverConfig, registerSyntheticAccount, secretValues, validateDatabaseEvidence } from './lib/synapse.mjs';
+import { SQLITE_CHECK_PY, databaseDiagnostic, generateSecrets, homeserverConfig, registerSyntheticAccount, secretValues, validateDatabaseEvidence } from './lib/synapse.mjs';
 import { applyDiffs, findConfirmed, findDecrypted } from './lib/timeline.mjs';
 import { decide } from './lib/verdict.mjs';
 import { PS, parseWatcherLog, pwsh, pwshJson, startWatcher } from './lib/windows.mjs';
@@ -242,6 +242,7 @@ export async function main(argv = process.argv.slice(2), platform = process.plat
     await coreA.call('messages.send', { room_id: roomId, body: canary });
     const confirmed = await waitTimeline(coreA, sub.subscription, sub.items, items => findConfirmed(items, canary), 'remote canary');
     const dbSeed = await querySqlite(distro, SQLITE_CHECK_PY, [roomId, confirmed.event_id, account.userId, canary], toolEnv);
+    diag.databaseSeed = databaseDiagnostic(dbSeed, { userId: account.userId, deviceId: before.device_id });
     const dbSeedCheck = validateDatabaseEvidence(dbSeed, { userId: account.userId, deviceId: before.device_id });
     if (!dbSeedCheck.ok) throw new Error(`server database: ${dbSeedCheck.problems.join('; ')}`);
     evidence.write('seed.json', { pid: seedApp.pid, version: asarPackageVersion(join(installDir, 'resources/app.asar')).version,
@@ -337,6 +338,7 @@ export async function main(argv = process.argv.slice(2), platform = process.plat
     const after = await until('restore', 120000, () => coreB.call('session.restore', {}).catch(() => null));
     await syncLive(coreB);
     const dbAfter = await querySqlite(distro, SQLITE_CHECK_PY, [roomId, confirmed.event_id, account.userId, canary], toolEnv);
+    diag.databaseAfter = databaseDiagnostic(dbAfter, { userId: account.userId, deviceId: before.device_id });
     const dbAfterCheck = validateDatabaseEvidence(dbAfter, { userId: account.userId, deviceId: before.device_id });
     const sameAccount = after.account_id === accountId && after.user_id === before.user_id && after.device_id === before.device_id
       && after.needs_reauth === false && dbAfterCheck.ok;
@@ -375,7 +377,8 @@ export async function main(argv = process.argv.slice(2), platform = process.plat
     await attempt('own-children', async () => { for (const r of live) if (r.exitCode === undefined && r.pid) process.kill(r.pid); });
     await attempt('diagnostics', async () => evidence.write('diagnostics.json', { classification: 'PUBLIC_NON_AUTHORIZING_DIAGNOSTIC',
       nativeAuthorization: false, reason: report.reason ?? null, steps: diag.steps, chain: diag.chain ?? null,
-      children: [...live].map(r => ({ pid: r.pid, exitCode: r.exitCode ?? null, stderrTail: r.stderrTail })) }));
+      databaseSeed: diag.databaseSeed ?? null, databaseAfter: diag.databaseAfter ?? null,
+      children: [...live].map(r => ({ pid: r.pid, exitCode: r.exitCode ?? null })) }));
     await attempt('private-root', async () => rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 }));
     if (cleanup.length) report.cleanupErrors = cleanup;
     const refused = evidence.audit();

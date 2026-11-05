@@ -150,10 +150,10 @@ c.execute("insert into events values('$e','m.room.encrypted','!r')"); c.execute(
 c.execute("insert into events values('$s','m.room.encryption','!r')"); c.execute("insert into event_json values('$s','!r',?)",(json.dumps({'content':{'algorithm':'m.megolm.v1.aes-sha2'}}),))
 c.execute("insert into current_state_events values('$s','!r','m.room.encryption','')"); c.execute("insert into devices values('@u:x','DEV',0)"); c.execute("insert into devices values('@u:x','MASTERKEY',1)")
 c.commit()`, db]);
-    const out = JSON.parse(execFileSync('python3', ['-', db, '!r', '$e', '@u:x', 'canary-abc'], { input: SQLITE_CHECK_PY, encoding: 'utf8' }));
+    const out = JSON.parse(execFileSync('python3', ['-c', SQLITE_CHECK_PY], { input: JSON.stringify([db, '!r', '$e', '@u:x', 'canary-abc']), encoding: 'utf8' }));
     assert.deepEqual(validateDatabaseEvidence(out, { userId: '@u:x', deviceId: 'DEV' }), { ok: true, problems: [] });
     execFileSync('python3', ['-c', 'import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); c.execute("insert into devices values(\'@u:x\',\'NEW\',0)"); c.execute("create table t(x text)"); c.execute("insert into t values(\'canary-abc\')"); c.commit()', db]);
-    const leaked = JSON.parse(execFileSync('python3', ['-', db, '!r', '$e', '@u:x', 'canary-abc'], { input: SQLITE_CHECK_PY, encoding: 'utf8' }));
+    const leaked = JSON.parse(execFileSync('python3', ['-c', SQLITE_CHECK_PY], { input: JSON.stringify([db, '!r', '$e', '@u:x', 'canary-abc']), encoding: 'utf8' }));
     assert.deepEqual(validateDatabaseEvidence(leaked, { userId: '@u:x', deviceId: 'DEV' }).problems,
       ['canary plaintext present in server database', 'device set is not exactly the Sable device']);
   } finally { rmSync(d, { recursive: true }); }
