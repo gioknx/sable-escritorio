@@ -1,4 +1,5 @@
 import { createHmac, randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { SYNAPSE } from './pins.mjs';
 
 // Segredos novos por execução; ficam só no privado (arquivo 0600 / config dentro da distro descartável).
@@ -68,43 +69,40 @@ export async function registerSyntheticAccount(baseUrl, secrets) {
 }
 
 // Executado pelo python da distro sobre o SQLite real do Synapse sintético. Somente leitura.
-export const SQLITE_CHECK_PY = String.raw`
-import json, sqlite3, sys, os
-db, room_id, event_id, user_id, canary = sys.argv[1:6]
-import shutil, tempfile, time
-src = db
-# WSL1 não suporta os locks do SQLite sobre o arquivo ao vivo: lê-se uma cópia privada. Nunca se copia o -shm (índice de memória
-# compartilhada do arquivo vivo, inconsistente na cópia); o SQLite reconstrói o índice do -wal copiado. Retenta até o evento aparecer.
-row = None; types = {}
-for attempt in range(20):
-    tmp = tempfile.mkdtemp(prefix='synapse-ro-'); db = os.path.join(tmp, 'copy.db')
-    for suffix in ('', '-wal', '-journal'):
-        if os.path.exists(src + suffix): shutil.copyfile(src + suffix, db + suffix)
-    con = sqlite3.connect(db)
-    row = con.execute('select e.type, j.json from events e join event_json j using(event_id) where e.event_id=? and e.room_id=?', (event_id, room_id)).fetchone()
-    if row: break
-    types = dict(con.execute('select type, count(*) from events where room_id=? group by type', (room_id,)).fetchall())
-    if attempt < 19: con.close(); time.sleep(1)
-out = {'eventFound': row is not None}
-if row is None: out['roomEventTypesSeen'] = types
-if row:
-    ev = json.loads(row[1]); content = ev.get('content', {})
-    out.update(eventType=row[0], hasBody='body' in content, contentAlgorithm=content.get('algorithm'), sender=ev.get('sender'))
-enc = con.execute("select j.json from current_state_events c join event_json j using(event_id) where c.room_id=? and c.type='m.room.encryption' and c.state_key=''", (room_id,)).fetchone()
-out['roomEncryption'] = json.loads(enc[0]).get('content', {}).get('algorithm') if enc else None
-out['devices'] = sorted(r[0] for r in con.execute('select device_id from devices where user_id=? and not hidden', (user_id,)))
-con.close()
-needle = canary.encode('utf-8'); found = False
-for name in (db, db + '-wal', db + '-journal'):
-    if os.path.exists(name):
-        with open(name, 'rb') as f:
-            if needle in f.read(): found = True
-out['canaryPlaintextInDatabase'] = found
-print(json.dumps(out, sort_keys=True))
-`;
+export const SQLITE_CHECK_PY = readFileSync(new URL('./sqlite-check.py', import.meta.url), 'utf8');
+
+// Public diagnostic: only allowlisted event types/algorithms, booleans and counts. Anything else from the
+// database is reported as 'other' / a count, so server-side text can never reach a public report.
+const PUBLIC_EVENT_TYPES = new Set(['m.room.create', 'm.room.encrypted', 'm.room.encryption', 'm.room.guest_access',
+  'm.room.history_visibility', 'm.room.join_rules', 'm.room.member', 'm.room.message', 'm.room.name', 'm.room.power_levels']);
+const publicType = value => value == null ? null : PUBLIC_EVENT_TYPES.has(value) ? value : 'other';
+const publicAlgorithm = value => value == null ? null : value === 'm.megolm.v1.aes-sha2' ? value : 'other';
+const publicCount = value => Number.isSafeInteger(value) && value >= 0 ? value : 0;
+const publicBool = value => typeof value === 'boolean' ? value : null;
+export function databaseDiagnostic(evidence, { userId, deviceId }) {
+  const types = {};
+  for (const [type, count] of Object.entries(evidence.roomEventTypesSeen ?? {})) {
+    const key = publicType(type); types[key] = publicCount(types[key]) + publicCount(count);
+  }
+  return {
+    eventFound: publicBool(evidence.eventFound),
+    roomEventTypesSeen: types,
+    eventType: publicType(evidence.eventType),
+    hasBody: publicBool(evidence.hasBody),
+    contentAlgorithm: publicAlgorithm(evidence.contentAlgorithm),
+    roomEncryption: publicAlgorithm(evidence.roomEncryption),
+    identifiersMatch: publicBool(evidence.identifiersMatch),
+    databaseConsistent: publicBool(evidence.databaseConsistent),
+    senderMatches: evidence.sender === userId,
+    deviceMatches: evidence.devices?.length === 1 && evidence.devices[0] === deviceId,
+    canaryPlaintextInDatabase: publicBool(evidence.canaryPlaintextInDatabase),
+  };
+}
 
 export function validateDatabaseEvidence(evidence, { userId, deviceId }) {
   const problems = [];
+  if (evidence.databaseConsistent !== true) problems.push('database consistency not proved');
+  if (evidence.identifiersMatch !== true) problems.push('event identifiers do not match');
   if (evidence.eventFound !== true) problems.push('event not stored');
   if (evidence.eventType !== 'm.room.encrypted') problems.push('stored type is not m.room.encrypted');
   if (evidence.hasBody !== false) problems.push('encrypted event content has body');

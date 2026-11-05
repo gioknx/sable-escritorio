@@ -18,7 +18,7 @@ import { allowlistEnv, appEnv, parseArgs, pathPreflight } from './lib/guards.mjs
 import { compareInventory, hashFile, inventory } from './lib/inventory.mjs';
 import { validateProcessChain } from './lib/nsis.mjs';
 import { ELECTRON, IDENTIFIER, PRODUCT_EXE, SYNAPSE, VERSIONS, WSL_ROOTFS } from './lib/pins.mjs';
-import { SQLITE_CHECK_PY, generateSecrets, homeserverConfig, registerSyntheticAccount, secretValues, validateDatabaseEvidence } from './lib/synapse.mjs';
+import { SQLITE_CHECK_PY, databaseDiagnostic, generateSecrets, homeserverConfig, registerSyntheticAccount, secretValues, validateDatabaseEvidence } from './lib/synapse.mjs';
 import { applyDiffs, findConfirmed, findDecrypted } from './lib/timeline.mjs';
 import { decide } from './lib/verdict.mjs';
 import { PS, parseWatcherLog, pwsh, pwshJson, startWatcher } from './lib/windows.mjs';
@@ -47,7 +47,9 @@ const spawned = [];
 function own(exe, args, env, live) {
   const at = new Date().toISOString();
   const child = spawn(exe, args, { env, shell: false, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
-  spawned.push({ pid: child.pid ?? null, image: exe, at });
+  const spawnRecord = { pid: child.pid ?? null, image: exe, at };
+  spawned.push(spawnRecord);
+  child.once('exit', () => { spawnRecord.until = new Date().toISOString(); });
   const record = { pid: child.pid ?? null, exitCode: undefined, signal: null, stderrTail: '' };
   child.stdout.resume();
   child.stderr.on('data', b => { record.stderrTail = (record.stderrTail + b.toString('utf8')).slice(-4096); });
@@ -242,6 +244,7 @@ export async function main(argv = process.argv.slice(2), platform = process.plat
     await coreA.call('messages.send', { room_id: roomId, body: canary });
     const confirmed = await waitTimeline(coreA, sub.subscription, sub.items, items => findConfirmed(items, canary), 'remote canary');
     const dbSeed = await querySqlite(distro, SQLITE_CHECK_PY, [roomId, confirmed.event_id, account.userId, canary], toolEnv);
+    diag.databaseSeed = databaseDiagnostic(dbSeed, { userId: account.userId, deviceId: before.device_id });
     const dbSeedCheck = validateDatabaseEvidence(dbSeed, { userId: account.userId, deviceId: before.device_id });
     if (!dbSeedCheck.ok) throw new Error(`server database: ${dbSeedCheck.problems.join('; ')}`);
     evidence.write('seed.json', { pid: seedApp.pid, version: asarPackageVersion(join(installDir, 'resources/app.asar')).version,
@@ -272,11 +275,26 @@ export async function main(argv = process.argv.slice(2), platform = process.plat
     checks.updateDownloadedHint = true;
 
     step('close-to-tray');
-    const tray = await electronCall(coreA, 'applyWindowSettings', [{ closeToTray: true, minimizeToTray: false, showSystemTrayIcon: true }]);
+    // Keep the genuine Windows default (custom title bar): omitting it makes the app recreate its window and drop the CDP page.
+    const tray = await electronCall(coreA, 'applyWindowSettings', [{ closeToTray: true, minimizeToTray: false, showSystemTrayIcon: true, useCustomTitleBar: true }]);
     if (tray.ok?.trayAvailable !== true) throw new Error('tray unavailable');
-    await electronCall(coreA, 'closeWindow');
-    await sleep(3000);
-    const visibility = await coreA.fn('function () { return document.visibilityState; }', []);
+    // Bounded, non-authorizing observation of the failing hide step: no URLs with paths, ids, messages or logs.
+    const observeClose = async (error) => {
+      const seen = { appExited: seedApp.exitCode !== undefined, error: String(error?.message ?? error).slice(0, 96) };
+      try {
+        const cdp = await Cdp.open(endA.browser);
+        try { seen.targets = (await cdp.send('Target.getTargets', {}, 5000)).targetInfos.map(t => ({ type: t.type, attached: t.attached, app: t.url.startsWith('sable-app://app') })); }
+        finally { cdp.close(); }
+      } catch (e) { seen.browserEndpoint = String(e?.message ?? e).slice(0, 64); }
+      try { seen.ownedProcessCount = [await pwshJson(PS.ownedProcesses, { ...toolEnv, ENSAIO_ROOT: installDir + '\\' }) ?? []].flat().length; } catch { seen.ownedProcessCount = null; }
+      diag.closeToTray = seen;
+    };
+    let visibility;
+    try {
+      await electronCall(coreA, 'closeWindow');
+      await sleep(3000);
+      visibility = await coreA.fn('function () { return document.visibilityState; }', []);
+    } catch (error) { await observeClose(error); throw error; }
     const runningAfterX = parseWatcherLog(readFileSync(watchLog, 'utf8')).rows.filter(r => r.executable.toLowerCase().startsWith(cacheRoot.toLowerCase() + '\\'));
     if (seedApp.exitCode !== undefined || visibility !== 'hidden' || runningAfterX.length
       || asarPackageVersion(join(installDir, 'resources/app.asar')).version !== VERSIONS.seed) throw new Error('X did not hide without installing');
@@ -308,7 +326,7 @@ export async function main(argv = process.argv.slice(2), platform = process.plat
       reopened: { pid: chain.reopened.pid, parent: chain.reopened.parent, created: chain.reopened.created, commandLine: chain.reopened.commandLine,
         sha256: chain.reopened.sha256, sid: chain.reopened.sid, sessionId: chain.reopened.sessionId },
       parentFacts: chain.launchMode === 'nsis-shell-broker' ? chain.reopened.parentFacts : null,
-      driverSpawns: spawned.map(s => ({ pid: s.pid, image: win32.basename(s.image), at: s.at })) });
+      driverSpawns: spawned.map(s => ({ pid: s.pid, image: win32.basename(s.image), at: s.at, until: s.until ?? null })) });
     report.launchMode = chain.launchMode; // 'direct' ou 'nsis-shell-broker'; broker é correlação via shell, não pai direto.
     checks.installerChain = true;
     if (installerExit?.exitCode !== 0) throw new Error(`installer exit ${installerExit?.exitCode}`);
@@ -337,6 +355,7 @@ export async function main(argv = process.argv.slice(2), platform = process.plat
     const after = await until('restore', 120000, () => coreB.call('session.restore', {}).catch(() => null));
     await syncLive(coreB);
     const dbAfter = await querySqlite(distro, SQLITE_CHECK_PY, [roomId, confirmed.event_id, account.userId, canary], toolEnv);
+    diag.databaseAfter = databaseDiagnostic(dbAfter, { userId: account.userId, deviceId: before.device_id });
     const dbAfterCheck = validateDatabaseEvidence(dbAfter, { userId: account.userId, deviceId: before.device_id });
     const sameAccount = after.account_id === accountId && after.user_id === before.user_id && after.device_id === before.device_id
       && after.needs_reauth === false && dbAfterCheck.ok;
@@ -375,7 +394,8 @@ export async function main(argv = process.argv.slice(2), platform = process.plat
     await attempt('own-children', async () => { for (const r of live) if (r.exitCode === undefined && r.pid) process.kill(r.pid); });
     await attempt('diagnostics', async () => evidence.write('diagnostics.json', { classification: 'PUBLIC_NON_AUTHORIZING_DIAGNOSTIC',
       nativeAuthorization: false, reason: report.reason ?? null, steps: diag.steps, chain: diag.chain ?? null,
-      children: [...live].map(r => ({ pid: r.pid, exitCode: r.exitCode ?? null, stderrTail: r.stderrTail })) }));
+      databaseSeed: diag.databaseSeed ?? null, databaseAfter: diag.databaseAfter ?? null, closeToTray: diag.closeToTray ?? null,
+      children: [...live].map(r => ({ pid: r.pid, exitCode: r.exitCode ?? null })) }));
     await attempt('private-root', async () => rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 }));
     if (cleanup.length) report.cleanupErrors = cleanup;
     const refused = evidence.audit();

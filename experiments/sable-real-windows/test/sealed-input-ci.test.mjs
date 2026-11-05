@@ -173,6 +173,9 @@ test('manual workflow stays bound to the driver allowlist, pinned file names, ke
   assert.ok(!/GITHUB_TOKEN|github\.token|persist-credentials: true|pull_request|push:/.test(yml));
   for (const pin of ['actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803', 'actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38',
     'actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02']) assert.ok(yml.includes(pin), pin);
-  assert.deepEqual([...yml.matchAll(/uses: (\S+)/g)].map(m => m[1].split('@')[1].length), [40, 40, 40]);
+  // Two jobs: the small query-only job and the complete rehearsal; every action in both is pinned by full SHA.
+  assert.deepEqual([...yml.matchAll(/uses: (\S+)/g)].map(m => m[1].split('@')[1].length), [40, 40, 40, 40, 40, 40]);
+  const queryJob = yml.slice(yml.indexOf('  sable-real-query:'), yml.indexOf('  sable-real:'));
+  assert.ok(queryJob.includes('ci/query-only.mjs') && !/secrets\.|cipher|driver\.mjs|electron|install-source/i.test(queryJob), 'query job has no key, private input or Sable build');
   assert.match(yml, /node-version: 24\.22\.0/); assert.match(yml, /timeout-minutes: 45/); assert.match(yml, /runs-on: windows-latest/);
 });

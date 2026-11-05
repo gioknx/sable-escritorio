@@ -1,4 +1,5 @@
 import { execFile, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { win32 } from 'node:path';
 import { SYNAPSE } from './pins.mjs';
 
@@ -57,9 +58,43 @@ export function startSynapse(name, env) {
     { env: { ...env, WSL_UTF8: '1' }, stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true });
 }
 
-export async function querySqlite(name, script, args, env) {
-  const out = await wsl(['-d', name, '-u', 'root', '--', `${VENV}/bin/python`, '-', `${DATA}/homeserver.db`, ...args], env, { input: script, timeout: 120000 });
-  return JSON.parse(out.trim().split(/\r?\n/).pop());
+// The program is a private file. Only JSON travels on stdin; no identifier is in argv.
+export async function querySqlite(name, script, args, env, { database = `${DATA}/homeserver.db` } = {}) {
+  const file = `${DATA}/sqlite-check.py`;
+  await inDistro(name, `umask 077; cat > ${file}; chmod 600 ${file}`, env, { input: script });
+  if (![`${DATA}/homeserver.db`, `${DATA}/negative.db`].includes(database)) throw new Error('sqlite database outside rehearsal');
+  const parameters = [database, ...args];
+  const out = await wsl(['-d', name, '-u', 'root', '--exec', `${VENV}/bin/python`, file], env,
+    { input: JSON.stringify(parameters), timeout: 120000 });
+  const evidence = JSON.parse(out.trim());
+  const expected = args.slice(0, 3).map(v => createHash('sha256').update(v).digest('hex'));
+  if (JSON.stringify(evidence.parameterDigests) !== JSON.stringify(expected)) throw new Error('sqlite parameter transport changed identifiers');
+  return evidence;
+}
+
+// Test-only: a private damaged copy of a coherent snapshot (event row without its JSON row).
+export async function makeInconsistentCopy(name, eventId, env) {
+  const program = `${DATA}/make-inconsistent.py`;
+  await inDistro(name, `umask 077; cat > ${program}`, env, { input: [
+    'import importlib.util, json, shutil, sqlite3, sys',
+    `spec = importlib.util.spec_from_file_location('q', '${DATA}/sqlite-check.py'); q = importlib.util.module_from_spec(spec); spec.loader.exec_module(q)`,
+    `with q.snapshot('${DATA}/homeserver.db') as copied:`,
+    `    c = sqlite3.connect(copied); c.execute('pragma wal_checkpoint(truncate)'); c.close()`,
+    `    shutil.copyfile(copied, '${DATA}/negative.db')`,
+    `con = sqlite3.connect('${DATA}/negative.db'); con.execute('pragma journal_mode=delete')`,
+    'con.execute("delete from event_json where event_id=?", (json.load(sys.stdin),)); con.commit(); con.close()', ''].join('\n') });
+  await wsl(['-d', name, '-u', 'root', '--exec', `${VENV}/bin/python`, program], env, { input: JSON.stringify(eventId), timeout: 60000 });
+}
+
+export async function transportProbe(name, values, env, legacy = false) {
+  const file = `${DATA}/transport-probe.py`;
+  await inDistro(name, `umask 077; cat > ${file}`, env,
+    { input: 'import json,sys\nprint(json.dumps(sys.argv[1:] if len(sys.argv)>1 else json.load(sys.stdin)))\n' });
+  const out = await wsl(legacy
+    ? ['-d', name, '-u', 'root', '--', `${VENV}/bin/python`, file, ...values]
+    : ['-d', name, '-u', 'root', '--exec', `${VENV}/bin/python`, file], env,
+    legacy ? {} : { input: JSON.stringify(values) });
+  return JSON.parse(out.trim());
 }
 
 export async function removeDistro(name, env) {

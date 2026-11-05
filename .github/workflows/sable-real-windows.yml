@@ -8,22 +8,59 @@ on:
     inputs:
       cipher_url:
         description: 'Exact https://github.com/gioknx/sable-escritorio/releases/download/<tag>/<asset> of the sealed test input'
-        required: true
+        required: false
         type: string
       cipher_sha256:
         description: 'SHA256 (64 lowercase hex) of the sealed blob, as printed by ci/sealed-input.mjs seal'
-        required: true
+        required: false
         type: string
       cipher_size:
         description: 'Exact size in bytes of the sealed blob, as printed by ci/sealed-input.mjs seal'
-        required: true
+        required: false
         type: string
+      mode:
+        description: 'full = complete update rehearsal (default, needs the three sealed-input fields); query = small Synapse/libolm query check, never an update approval'
+        required: false
+        default: full
+        type: choice
+        options: [full, query]
 
 permissions:
   contents: read
 
 jobs:
+  sable-real-query:
+    if: ${{ inputs.mode == 'query' }}
+    runs-on: windows-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 24.22.0
+          package-manager-cache: false
+      - name: Query-only check on disposable WSL1 Synapse; no Sable source, build, install or updater
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $out = Join-Path $env:RUNNER_TEMP 'query-result.json'
+          & node experiments/sable-real-windows/ci/query-only.mjs | Tee-Object -FilePath $out
+          if ($LASTEXITCODE -ne 0) { throw 'Query-only check failed' }
+      - name: Upload the bounded public query report only
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: sable-real-query-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/query-result.json
+          if-no-files-found: warn
+          retention-days: 7
+
   sable-real:
+    if: ${{ inputs.mode != 'query' }}
     runs-on: windows-latest
     timeout-minutes: 45
     defaults:

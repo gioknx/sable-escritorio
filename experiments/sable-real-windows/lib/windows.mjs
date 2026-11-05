@@ -16,7 +16,23 @@ ConvertTo-Json -Compress -Depth 3 -InputObject $e`,
   peVersion: `$ErrorActionPreference='Stop'; $v=(Get-Item -LiteralPath $env:ENSAIO_PATH).VersionInfo; ConvertTo-Json -Compress -InputObject @{file=$v.FileVersion;product=$v.ProductVersion}`,
   // Término abrupto (TerminateProcess) só de PID observado cuja imagem está dentro da raiz própria.
   stopOwned: `$ErrorActionPreference='Stop'; $done=@()
-foreach($id in ($env:ENSAIO_PIDS -split ',')){ $p=Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$id)"; if($p -and $p.ExecutablePath -and $p.ExecutablePath.StartsWith($env:ENSAIO_ROOT,[StringComparison]::OrdinalIgnoreCase)){ Stop-Process -Id ([int]$id) -Force; $done+=[int]$id } }
+foreach($id in ($env:ENSAIO_PIDS -split ',')){
+  if($id -notmatch '^[1-9][0-9]*$'){ throw 'invalid owned PID' }
+  $p=Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$id)"
+  if(-not $p){ continue }
+  if(-not $p.ExecutablePath -or -not $p.ExecutablePath.StartsWith($env:ENSAIO_ROOT,[StringComparison]::OrdinalIgnoreCase)){ throw 'PID no longer belongs to rehearsal' }
+  try { Stop-Process -Id ([int]$id) -Force -ErrorAction Stop }
+  catch {
+    if($_.CategoryInfo.Category -ne [Management.Automation.ErrorCategory]::ObjectNotFound){ throw }
+    if(Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$id)"){ throw }
+  }
+  $deadline=[DateTime]::UtcNow.AddSeconds(10)
+  while(Get-CimInstance Win32_Process -Filter "ProcessId=$([int]$id)"){
+    if([DateTime]::UtcNow -ge $deadline){ throw 'owned process is still alive' }
+    Start-Sleep -Milliseconds 50
+  }
+  $done+=[int]$id
+}
 ConvertTo-Json -Compress -InputObject @($done)`,
   ownedProcesses: `$ErrorActionPreference='Stop'
 $r=@(Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.StartsWith($env:ENSAIO_ROOT,[StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { @{pid=[int]$_.ProcessId;parent=[int]$_.ParentProcessId;executable=$_.ExecutablePath;commandLine=$_.CommandLine} })

@@ -77,7 +77,10 @@ export function validateProcessChain(rows, exits, o) {
   for (const row of rows) if (Number.isInteger(row.pid) && row.pid > 0 && !byPid.has(row.pid)) byPid.set(row.pid, row);
   const all = [...byPid.values()];
   const appExe = win32.join(o.installDir, PRODUCT_EXE);
-  const driverPids = new Set(o.driverSpawns.map(s => s.pid));
+  // Windows reuses PIDs. A driver child owns a PID only for its own lifetime [at, until]; a process created after
+  // that child exited is another process (unknown creation time or no recorded exit: conservatively the driver's).
+  const driverOwns = (pid, created) => o.driverSpawns.some(s => s.pid === pid
+    && (!created || !(time(created) > time(s.until ?? '9999-12-31T00:00:00.000Z') || time(created) < time(s.at))));
   const seed = byPid.get(o.seedPid);
   if (!seed || !same(seed.executable, appExe) || argsOf(seed).length !== 0) problems.push('relaunched seed not observed with genuine image/argv');
   const installers = all.filter(r => r.parent === o.seedPid && insideWin(o.cacheRoot, r.executable) && /\.exe$/i.test(r.executable));
@@ -90,7 +93,7 @@ export function validateProcessChain(rows, exits, o) {
   if (installer) {
     problems.push(...validateInstallerCommand(installer.commandLine, installer.executable, o.installDir).problems);
     if (installer.sha512 !== o.expectedInstallerSha512) problems.push('installer image is not the authenticated payload');
-    if (driverPids.has(installer.pid)) problems.push('installer pid was spawned by driver');
+    if (driverOwns(installer.pid, installer.created)) problems.push('installer pid was spawned by driver');
     const exit = exits.get(installer.pid);
     if (!exit) problems.push('installer exit not observed');
     else if (exit.exitCode !== 0) problems.push(`installer exit ${exit.exitCode}`);
@@ -99,7 +102,7 @@ export function validateProcessChain(rows, exits, o) {
     if (reopened) {
       const a = argsOf(reopened);
       if (a.length !== 1 || a[0] !== '--updated') problems.push(`reopened args not NSIS StartApp: ${JSON.stringify(a).slice(0, 256)}`);
-      if (driverPids.has(reopened.pid) || reopened.pid === o.seedPid || reopened.pid === installer.pid) problems.push('reopened pid not new');
+      if (driverOwns(reopened.pid, reopened.created) || reopened.pid === o.seedPid || reopened.pid === installer.pid) problems.push('reopened pid not new');
       if (reopened.sha256 !== o.expectedExeSha256) problems.push('reopened image hash is not the 2.2.3 executable');
       const created = time(reopened.created), start = time(installer.created), end = exit ? time(exit.exitedAt) + LAUNCH_WINDOW_MS : NaN;
       if (!(created >= start && created <= end)) problems.push('reopened creation outside installer lifetime window');
@@ -116,7 +119,7 @@ export function validateProcessChain(rows, exits, o) {
           if (p.signatureStatus !== 'Valid' || !MICROSOFT_WINDOWS(parseSubject(p.signer))) brokerProblems.push('parent signature is not valid Microsoft Windows');
           if (p.sid !== reopened.sid || p.sessionId !== reopened.sessionId) brokerProblems.push('parent SID/session differs');
           if (!(time(p.created) < created)) brokerProblems.push('parent not created before reopened app');
-          if (driverPids.has(p.pid) || byPid.has(p.pid)) brokerProblems.push('parent pid belongs to ensaio processes');
+          if (driverOwns(p.pid, p.created) || byPid.has(p.pid)) brokerProblems.push('parent pid belongs to ensaio processes');
         }
         if (brokerProblems.length) problems.push(`reopened parent is neither installer nor genuine shell broker: ${brokerProblems.join('; ')}`);
         else launchMode = 'nsis-shell-broker';
@@ -124,7 +127,7 @@ export function validateProcessChain(rows, exits, o) {
     }
   }
   const strayMains = all.filter(r => same(r.executable, appExe) && isMain(r) && r.pid !== o.seedPid && r.pid !== reopened?.pid
-    && !o.driverSpawns.some(s => s.pid === r.pid && installer && time(s.at) < time(installer.created)));
+    && !(installer && time(r.created) < time(installer.created) && driverOwns(r.pid, r.created)));
   if (strayMains.length) problems.push(`app main processes outside chain: ${strayMains.map(r => r.pid).join(',')}`);
   const mains = all.filter(r => same(r.executable, appExe) && isMain(r))
     .map(r => ({ pid: r.pid, parent: r.parent, args: argsOf(r).slice(0, 4), created: r.created ?? null }));
