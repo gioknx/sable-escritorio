@@ -241,13 +241,14 @@ o pip freeze vai para synapse.json.
 
 ## Resultado medido e próximo passo (05/11/2026)
 
-Estado: o fluxo completo passou uma vez no Windows descartável do GitHub (run 41992935052, commit 5dd14af
-da branch gio/sable-real-windows-4): PASS, nativeAuthorization true, 18 de 18 elos, sem erro de limpeza.
-Vale para esta versão do ensaio e para a fonte comprovada acima. Não é publicação nem ativação da
+Estado: o fluxo completo passou duas vezes seguidas no Windows descartável do GitHub, no mesmo código
+(commit 165a258 da branch gio/sable-real-windows-4; runs 41998527971 e 41998531727): PASS,
+nativeAuthorization true, 18 de 18 elos, sem erro de limpeza, launchMode nsis-shell-broker nas duas. A checagem
+curta do mesmo commit também passou (run 41998536111, QUERY_CHECKED). Depois desse commit só mudaram README e
+documentação. Vale para esta versão do ensaio e para a fonte comprovada acima. Não é publicação nem ativação da
 atualização para usuários, não é prova de SSO nem de primeira entrada, e não altera o Sable em uso.
-Rodada única: a repetição na mesma versão ainda não foi medida.
 
-Falhas encontradas e causa (as três eram do roteiro, nenhuma do Sable):
+Falhas encontradas e causa (as quatro eram do roteiro; em nenhuma o Sable falhou):
 - A consulta ao banco do Synapse passava os identificadores pela linha de comando do wsl.exe; o identificador
   do evento começa com $ e o shell da distro o alterava. Agora os parâmetros vão como JSON na entrada padrão
   para um programa Python privado (lib/sqlite-check.py), conferidos por resumo SHA-256, com instantâneo
@@ -257,18 +258,27 @@ Falhas encontradas e causa (as três eram do roteiro, nenhuma do Sable):
   parada é normal; acesso negado ou processo ainda vivo continua erro.
 - Aplicar close-to-tray sem useCustomTitleBar fazia o Sable (padrão Windows: barra própria) recriar a janela e
   derrubar a página CDP do roteiro. O roteiro agora mantém a barra própria.
+- O Windows reaproveitou o número (PID) de um processo antigo do próprio roteiro para o instalador, e a cadeia
+  rejeitou "instalador criado pelo driver" (run 41996694042). Agora um PID só é do driver durante a vida do
+  processo filho (início e fim registrados); fora disso é outro processo. Sem fim registrado, continua sendo do
+  driver (conservador). O teste reproduz a falha com o código antigo.
+
+Relatórios públicos: só enums conhecidos, booleanos e contagens. Falha da checagem curta publica um código fixo,
+nunca valor comparado, identificador, mensagem ou texto decifrado (testes cobrem os dois caminhos).
 
 Checagem curta: workflow sable-real-windows.yml com mode=query roda só Synapse real, evento cifrado conhecido
 (libolm 3.2.15, hash pinado) e a consulta, sem Sable, compilação ou instalação, e termina QUERY_CHECKED, nunca
-aprovação da atualização. Prova (run 41990595436): o caminho antigo reproduz a perda do identificador; o novo
-preserva; evento presente passa; ausente, identificador alterado, texto claro e banco incoerente reprovam. As
-condições de limpeza "processo já saiu" e "acesso negado/ainda vivo" usam substitutos do Stop-Process; a
-ausência real de PID foi medida. O modo full continua sendo o padrão e o único que autoriza.
+aprovação da atualização. O caminho antigo reproduz a perda do identificador; o novo preserva; evento presente
+passa; ausente, identificador alterado, texto claro e banco incoerente reprovam. As condições de limpeza "processo
+já saiu" e "acesso negado/ainda vivo" usam substitutos do Stop-Process; a ausência real de PID foi medida. O modo
+full continua sendo o padrão e o único que autoriza.
 
-Tempos medidos (horários dos passos): completo aprovado 4m50s no total, 3m55s no driver: compilação 2m06s,
-Synapse 52s, instalação do seed 16s, atualização e validação cerca de 24s. Checagem curta 3m26s, dominada pelo
-Synapse sob WSL1 (147s). As rodadas anteriores falhavam depois de 5 a 7 minutos; o ganho vem de isolar a falha e
-corrigir na branch, não de acelerar o fluxo. Sem cache nesta entrega.
+Tempos medidos (horários dos passos, duas rodadas completas finais): job inteiro 8m00 e 8m14; driver 6m10 e 6m21;
+compilação 3m28 e 3m49; Synapse 71 s e 83 s; instalação do seed 20 s e 23 s; atualização e validação cerca de 25 s.
+A rodada aprovada anterior, em outro runner, levou 4m50 no job (compilação 2m06): a compilação varia quase 2x
+entre runners e domina o total. Checagem curta: 3m26 (Synapse sob WSL1 147 s). O ganho está em isolar e corrigir
+a falha na branch (a falha da quarta rodada original custou 6m48 para cada tentativa completa; a curta confirma a
+correção em 3m26 e sem compilar), não em fluxo mais rápido: não há 10x. Sem cache nesta entrega.
 
 Fonte de manutenção e cópia de execução: sable/desktop-windows-test (fonte) e experiments/sable-real-windows
 (cópia no repo sable-escritorio) são idênticas, incluindo ci/. Única exceção de execução:
