@@ -275,9 +275,23 @@ export async function main(argv = process.argv.slice(2), platform = process.plat
     step('close-to-tray');
     const tray = await electronCall(coreA, 'applyWindowSettings', [{ closeToTray: true, minimizeToTray: false, showSystemTrayIcon: true }]);
     if (tray.ok?.trayAvailable !== true) throw new Error('tray unavailable');
-    await electronCall(coreA, 'closeWindow');
-    await sleep(3000);
-    const visibility = await coreA.fn('function () { return document.visibilityState; }', []);
+    // Bounded, non-authorizing observation of the failing hide step: no URLs with paths, ids, messages or logs.
+    const observeClose = async (error) => {
+      const seen = { appExited: seedApp.exitCode !== undefined, error: String(error?.message ?? error).slice(0, 96) };
+      try {
+        const cdp = await Cdp.open(endA.browser);
+        try { seen.targets = (await cdp.send('Target.getTargets', {}, 5000)).targetInfos.map(t => ({ type: t.type, attached: t.attached, app: t.url.startsWith('sable-app://app') })); }
+        finally { cdp.close(); }
+      } catch (e) { seen.browserEndpoint = String(e?.message ?? e).slice(0, 64); }
+      try { seen.ownedProcessCount = [await pwshJson(PS.ownedProcesses, { ...toolEnv, ENSAIO_ROOT: installDir + '\\' }) ?? []].flat().length; } catch { seen.ownedProcessCount = null; }
+      diag.closeToTray = seen;
+    };
+    let visibility;
+    try {
+      await electronCall(coreA, 'closeWindow');
+      await sleep(3000);
+      visibility = await coreA.fn('function () { return document.visibilityState; }', []);
+    } catch (error) { await observeClose(error); throw error; }
     const runningAfterX = parseWatcherLog(readFileSync(watchLog, 'utf8')).rows.filter(r => r.executable.toLowerCase().startsWith(cacheRoot.toLowerCase() + '\\'));
     if (seedApp.exitCode !== undefined || visibility !== 'hidden' || runningAfterX.length
       || asarPackageVersion(join(installDir, 'resources/app.asar')).version !== VERSIONS.seed) throw new Error('X did not hide without installing');
@@ -377,7 +391,7 @@ export async function main(argv = process.argv.slice(2), platform = process.plat
     await attempt('own-children', async () => { for (const r of live) if (r.exitCode === undefined && r.pid) process.kill(r.pid); });
     await attempt('diagnostics', async () => evidence.write('diagnostics.json', { classification: 'PUBLIC_NON_AUTHORIZING_DIAGNOSTIC',
       nativeAuthorization: false, reason: report.reason ?? null, steps: diag.steps, chain: diag.chain ?? null,
-      databaseSeed: diag.databaseSeed ?? null, databaseAfter: diag.databaseAfter ?? null,
+      databaseSeed: diag.databaseSeed ?? null, databaseAfter: diag.databaseAfter ?? null, closeToTray: diag.closeToTray ?? null,
       children: [...live].map(r => ({ pid: r.pid, exitCode: r.exitCode ?? null })) }));
     await attempt('private-root', async () => rmSync(root, { recursive: true, force: true, maxRetries: 20, retryDelay: 200 }));
     if (cleanup.length) report.cleanupErrors = cleanup;
